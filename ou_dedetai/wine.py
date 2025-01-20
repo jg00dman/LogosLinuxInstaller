@@ -273,14 +273,9 @@ def install_msi(app: App):
     app.status(f"Running MSI installer: {app.conf.faithlife_installer_name}.")
     # Execute the .MSI
     wine_exe = app.conf.wine64_binary
-    exe_args = ["/i", f"{app.conf.install_dir}/data/wine64_bottle/drive_c/{app.conf.faithlife_installer_name}"] #noqa: E501
+    exe_args = ["/i", f"{app.conf.install_dir}/data/{app.conf.faithlife_installer_name}"] #noqa: E501
     if app.conf._overrides.faithlife_install_passive is True:
         exe_args.append('/passive')
-    
-    # Add mst if needed
-    if release_version is not None and utils.check_logos_release_version(release_version, 39, 1):
-        exe_args.append(f'TRANSFORMS="{app.conf.install_dir}/data/wine64_bottle/drive_c/LogosStubFailOK.mst"')
-
     logging.info(f"Running: {wine_exe} msiexec {' '.join(exe_args)}")
     process = run_wine_proc(wine_exe, app, exe="msiexec", exe_args=exe_args)
     return process

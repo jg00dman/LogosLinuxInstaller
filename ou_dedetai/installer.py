@@ -177,18 +177,12 @@ def ensure_product_installer_download(app: App):
         app=app,
     )
     # Copy file into install dir.
-    installer = Path(f"{app.conf.install_dir}/data/wine64_bottle/drive_c/{app.conf.faithlife_installer_name}")
+    installer = Path(f"{app.conf.install_dir}/data/{app.conf.faithlife_installer_name}")
     if not installer.is_file():
         shutil.copy(downloaded_file, installer.parent)
 
-    # Copy the MST file
-    mst_source = app.APP_ASSETS_DIR / "wine64_bottle/drive_c/LogosStubFailOK.mst"
-    mst_destination = Path(app.conf.install_dir) / "data/LogosStubFailOK.mst"
-    if not mst_destination.is_file():
-        shutil.copy(mst_source, mst_destination)
-
     logging.debug(f"> '{downloaded_file}' exists?: {Path(downloaded_file).is_file()}")  # noqa: E501
-    logging.debug(f"MST present: {mst_destination.is_file()}")
+
 
 def ensure_wineprefix_init(app: App):
     app.installer_step_count += 1

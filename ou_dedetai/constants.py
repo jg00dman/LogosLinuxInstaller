@@ -4,7 +4,6 @@ from pathlib import Path
 
 # This is relative to this file itself
 APP_IMAGE_DIR = Path(__file__).parent / "img"
-APP_ASSETS_DIR = Path(__file__).parent / "assets"
 
 # Define app name variables.
 APP_NAME = 'Ou Dedetai'
