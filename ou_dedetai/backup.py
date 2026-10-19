@@ -1,8 +1,10 @@
 import abc
 import queue
+import hashlib
+import tempfile
+from concurrent.futures import Future
 import logging
 import shutil
-import time
 from pathlib import Path
 from typing import List, Optional
 from typing import Tuple
@@ -55,7 +57,7 @@ class BackupBase(abc.ABC):
         all_backups = [
             str(d) 
             for d in self.backup_dir.glob('*') 
-            if d.is_dir() and d.name.startswith(self.app.conf.faithlife_product)
+            if d.is_dir() and d.name.startswith(self.app.conf.faithlife_product) and not d.name.endswith('.incomplete')
         ]
         all_backups.sort()
         logging.debug(all_backups)
@@ -89,48 +91,98 @@ class BackupBase(abc.ABC):
             self.app.exit(f"there are no files to {self.mode}")
         return dirs
 
-    def _prepare_dest_dir(self) -> None:
-        """Remove existing data."""
-        for d in self.DATA_DIRS:
-            dst = self.destination_dir / d
-            if dst.is_dir():
-                shutil.rmtree(dst)
+    def _copy_and_verify(self, src_dirs: List[Path], stage: Path) -> None:
+        self._copy_dirs(src_dirs, stage)
+        for src in src_dirs:
+            for original in src.rglob('*'):
+                if original.is_file():
+                    copied = stage / src.name / original.relative_to(src)
+                    with original.open('rb') as source, copied.open('rb') as target:
+                        source_hash = hashlib.file_digest(source, 'sha256').digest()
+                        if source_hash != hashlib.file_digest(target, 'sha256').digest():
+                            raise OSError(f"Copy verification failed: {original}")
+
+    def _commit_restore(self, stage: Path, src_dirs: List[Path]) -> None:
+        """Keep originals until all replacements succeed; retain recovery files if rollback fails."""
+        originals = stage / 'originals'
+        originals.mkdir()
+        moved = []
+        installed = []
+        try:
+            for src in src_dirs:
+                destination = self.destination_dir / src.name
+                if destination.exists():
+                    destination.rename(originals / src.name)
+                    moved.append(src.name)
+                (stage / src.name).rename(destination)
+                installed.append(src.name)
+        except BaseException:
+            try:
+                for name in reversed(installed):
+                    (self.destination_dir / name).rename(stage / name)
+                for name in reversed(moved):
+                    (originals / name).rename(self.destination_dir / name)
+            except OSError as error:
+                raise OSError(f"Restore rollback failed. Original data retained in {originals}: {error}") from error
+            raise
 
     def _run(self) -> None:
-        self.app.status(f"Running {self.mode} from {self.source_dir} to {self.destination_dir}") 
-        if self.source_dir is None:
-            self.app.exit("source directory not set")
-        elif self.destination_dir is None:
-            self.app.exit("destination directory not set")
-        src_dirs = self._get_source_subdirs()
-
-        self.data_size = self._get_dir_group_size(src_dirs)
-        self._prepare_dest_dir()
-        self.destination_disk_used_init = self._get_dest_disk_used()
-        self._verify_disk_space()
-        # logging.debug("starting data copy thread")
-        t = self.app.start_thread(self._copy_dirs, src_dirs, self.destination_dir)
+        stage = None
         try:
-            while t.is_alive():
-                self.app.status("copying…", self._get_copy_percentage())
-                time.sleep(0.5)
-            print()
-        except KeyboardInterrupt:
-            print()
-            self.app.exit("user cancelled with Ctrl+C.")
-        t.join()
-        # logging.debug("finished data copy thread")
-        m = f"Finished {self.mode}. {self.data_size} bytes copied."
-        self.app.status(m)
+            self.app.logos.get_logos_pids()
+            if any(p.is_running() for group in self.app.logos.existing_processes.values() for p in group):
+                self.app.info("Stop Logos and its indexer before backing up or restoring data.")
+                return
+            src_dirs = self._get_source_subdirs()
+            self.app.status(f"Running {self.mode} from {self.source_dir} to {self.destination_dir}")
+            if any(self.destination_dir.resolve().is_relative_to(src.resolve()) for src in src_dirs):
+                raise OSError("Destination must not be inside the data being copied.")
+            self.data_size = max(1, self._get_dir_group_size(src_dirs))
+            self._verify_disk_space()
+            self.destination_disk_used_init = self._get_dest_disk_used()
+            stage = Path(tempfile.mkdtemp(prefix='.oudedetai-copy-', dir=self.destination_dir))
+            result = Future()
+
+            def copy():
+                try:
+                    self._copy_and_verify(src_dirs, stage)
+                except BaseException as error:
+                    result.set_exception(error)
+                else:
+                    result.set_result(None)
+
+            worker = self.app.start_thread(copy)
+            try:
+                while worker.is_alive():
+                    self.app.status("Copying and verifying…", self._get_copy_percentage())
+                    worker.join(timeout=0.5)
+            finally:
+                # Do not remove staging while the copy thread is still writing.
+                worker.join()
+            result.result()
+            self._commit_restore(stage, src_dirs)
+            shutil.rmtree(stage)
+            stage = None
+            if self.mode == 'backup':
+                completed = self.destination_dir.with_suffix('')
+                self.destination_dir.rename(completed)
+                self._destination_dir = completed
+            self.app.status(f"Finished {self.mode}. {self.data_size} bytes copied and verified.")
+        except (OSError, KeyboardInterrupt) as error:
+            logging.exception("%s failed", self.mode)
+            self.app.info(f"{self.mode.capitalize()} failed: {error}")
+        finally:
+            if stage is not None:
+                # A failed rollback may leave the only original data here.
+                originals = stage / 'originals'
+                if originals.exists() and any(originals.iterdir()):
+                    self.app.info(f"Recovery data retained at {originals}")
+                else:
+                    shutil.rmtree(stage, ignore_errors=True)
 
     def _verify_disk_space(self) -> None:
         if not utils.enough_disk_space(self.destination_dir, self.data_size):
-            try:
-                self.destination_dir.rmdir()
-            except OSError:  # folder not empty
-                logging.error(f"Tried to remove non-empty folder: {self.destination_dir}")
-            self.app.exit(f"not enough free disk space for {self.mode}.")
-        logging.debug(f"Sufficient space verified on {self.destination_dir} disk.")
+            raise OSError(f"Not enough free disk space for {self.mode}.")
 
     @property
     def source_dir(self) -> Path:
@@ -172,16 +224,13 @@ class BackupTask(BackupBase):
     def _get_destination_dir(self) -> Path:
         """Destination path. Differs depending on backup/restore"""
         timestamp = utils.get_timestamp().replace('-', '')
-        name = f"{self.app.conf.faithlife_product}-{timestamp}"
+        name = f"{self.app.conf.faithlife_product}-{timestamp}.incomplete"
         destination_dir = self.backup_dir / name
         logging.debug(f"Backup directory path: {destination_dir}.")
 
-        # Check for existing backup.
-        try:
-            destination_dir.mkdir()
-        except FileExistsError:
-            # This shouldn't happen, there is a timestamp in the backup_dir name
-            logging.warning(f"Backup already exists at: {destination_dir}.")
+        if destination_dir.with_suffix('').exists():
+            raise FileExistsError(f"Backup already exists: {destination_dir.with_suffix('')}")
+        destination_dir.mkdir()
         return destination_dir
 
 
@@ -200,6 +249,8 @@ class RestoreTask(BackupBase):
 
     def _get_source_dir(self) -> Path:
         all_backups = self._get_all_backups()
+        if not all_backups:
+            raise OSError("No completed backups are available.")
         latest = all_backups.pop(-1)
 
         # Offer to restore the most recent backup.
