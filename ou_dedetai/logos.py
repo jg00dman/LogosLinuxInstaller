@@ -29,6 +29,7 @@ class LogosManager:
         self.logos_state = State.STOPPED
         self.indexing_state = State.STOPPED
         self.app = app
+        self._issue_monitor_stop = threading.Event()
         self.processes: dict[str, subprocess.Popen] = {}
         """These are sub-processes we started"""
         self.existing_processes: dict[str, list[psutil.Process]] = {}
@@ -101,7 +102,10 @@ class LogosManager:
             # Useful if the install directory got deleted while executing
             self.logos_state = State.STOPPED
 
-    def monitor_for_potential_issues(self):
+    def stop_issue_monitoring(self):
+        self._issue_monitor_stop.set()
+
+    def monitor_for_potential_issues(self, stop_event: threading.Event):
         """A function to be run in parallel with running Logos to detect common issues and suggest workarounds"""
         # Make sure we have a logos appdata, without it we can't reliably do any checks
         logos_appdata_dir = self.app.conf._logos_appdata_dir
@@ -109,7 +113,8 @@ class LogosManager:
             logging.warning("The user should have installed the Logos application by now and have this populated."
                             " Waiting until that is resolved…")
             while logos_appdata_dir is None:
-                time.sleep(1)
+                if stop_event.wait(1):
+                    return
                 logos_appdata_dir = self.app.conf._logos_appdata_dir
         
         # See if the user is logged in, this may change which things we look for
@@ -121,9 +126,7 @@ class LogosManager:
 
         time_logos_started = time.time()
 
-        while True:
-            # Now we wait...
-            time.sleep(10)
+        while not stop_event.wait(10):
 
             if not is_user_logged_in:
                 if get_logos_user_id(logos_appdata_dir) is not None:
@@ -133,7 +136,8 @@ class LogosManager:
                     # Took me about ~1.5 minutes to sign on while simulating a little dilly-dallying and a couple
                     # incorrect password attempts. Should still be longer than most people take to sign on, but not SO
                     # long that people close OD in frustration to try again - fine line of balance.
-                    if not sent_trouble_signing_in_message and time.time() - time_logos_started > 60 * 1.75:
+                    if (not stop_event.is_set() and not sent_trouble_signing_in_message
+                            and time.time() - time_logos_started > 60 * 1.75):
                         # It's been five minutes since the user launched Logos and yet they haven't logged in yet.
                         # Are they having trouble?
                         self.app.pop_up(
@@ -184,7 +188,10 @@ class LogosManager:
             wine.wineserver_kill(self.app)
             # Don't send "Running" message to GUI b/c it never clears.
             logging.info(f"Running {self.app.conf.faithlife_product}…")
-            self.app.start_thread(self.monitor_for_potential_issues, daemon_bool=False)
+            self.stop_issue_monitoring()
+            self._issue_monitor_stop = threading.Event()
+            # A UI popup may itself block; this advisory task must not hold up process exit.
+            self.app.start_thread(self.monitor_for_potential_issues, self._issue_monitor_stop, daemon_bool=True)
             self.app.start_thread(run_logos, daemon_bool=False)
             # NOTE: The following code would keep the CLI open while running
             # Logos, but since wine logging is sent directly to wine.log,
@@ -265,6 +272,7 @@ class LogosManager:
     # alone for now. Only found it when manually modifying the database.
 
     def stop(self):
+        self.stop_issue_monitoring()
         logging.debug("Stopping LogosManager.")
         self.logos_state = State.STOPPING
         if len(self.existing_processes) == 0:
@@ -290,6 +298,7 @@ class LogosManager:
         # wine.wineserver_wait(self.app)
 
     def end_processes(self):
+        self.stop_issue_monitoring()
         for process_name, process in self.processes.items():
             if isinstance(process, subprocess.Popen):
                 logging.debug(f"Found {process_name} in Processes. Attempting to close {process}.")

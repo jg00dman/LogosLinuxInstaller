@@ -59,6 +59,7 @@ class TestAppExit(unittest.TestCase):
         manager = Mock()
         app._exit = manager._exit
         app.logos.end_processes = manager.end_processes
+        app.logos.stop_issue_monitoring = manager.stop_issue_monitoring
 
         with self.assertRaises(SystemExit):
             app.exit("done", intended=True)
@@ -67,7 +68,7 @@ class TestAppExit(unittest.TestCase):
         # _exit must run before processes are ended.
         self.assertEqual(
             [c[0] for c in manager.mock_calls],
-            ["_exit", "end_processes"],
+            ["stop_issue_monitoring", "_exit", "end_processes"],
         )
         app._schedule_exit_on_main_thread.assert_not_called()
 

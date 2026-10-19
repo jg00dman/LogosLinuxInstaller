@@ -181,6 +181,7 @@ class App(abc.ABC):
             # thread); also frees any join() the main-thread exit waits on.
             raise SystemExit
         logging.debug(f"Closing {constants.APP_NAME}.")
+        self.logos.stop_issue_monitoring()
         self._exit(reason, intended)
         # Shutdown logos/indexer if we spawned it
         self.logos.end_processes()
