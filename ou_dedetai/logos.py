@@ -13,7 +13,6 @@ from ou_dedetai.app import App
 from ou_dedetai.config import get_logos_user_id
 
 from . import system
-from . import utils
 from . import wine
 
 
@@ -28,6 +27,7 @@ class LogosManager:
     def __init__(self, app: App):
         self.logos_state = State.STOPPED
         self.indexing_state = State.STOPPED
+        self._indexing_cancelled = threading.Event()
         self.app = app
         self.processes: dict[str, subprocess.Popen] = {}
         """These are sub-processes we started"""
@@ -302,54 +302,59 @@ class LogosManager:
 
     def index(self):
         self.indexing_state = State.STARTING
-        index_finished = threading.Event()
+        self._indexing_cancelled.clear()
 
         def run_indexing():
-            if not self.app.conf.logos_indexer_exe_windows_path:
-                raise ValueError("Cannot find installed indexer")
-            process = wine.run_wine_application(
-                app=self.app,
-                wine_binary=self.app.conf.wine_binary,
-                exe=self.app.conf.logos_indexer_exe_windows_path
-            )
-            if process is not None:
-                self.processes[self.app.conf.logos_indexer_exe_windows_path] = process
-
-        def check_if_indexing(process: threading.Thread):
-            start_time = time.time()
-            last_time = start_time
-            update_send = 0
-            while process.is_alive():
-                update, last_time = utils.stopwatch(last_time, 3)
-                if update:
-                    update_send = update_send + 1
-                if update_send == 10:
-                    total_elapsed_time = time.time() - start_time
-                    elapsed_min = int(total_elapsed_time // 60)
-                    elapsed_sec = int(total_elapsed_time % 60)
-                    formatted_time = f"{elapsed_min}m {elapsed_sec}s"
-                    self.app.status(f"Indexing is running… (Elapsed Time: {formatted_time})")
-                    update_send = 0
-            index_finished.set()
-
-        def wait_on_indexing():
-            index_finished.wait()
-            self.indexing_state = State.STOPPED
-            self.app.status("Indexing has finished.", percent=100)
-            wine.wineserver_wait(app=self.app)
+            try:
+                exe = self.app.conf.logos_indexer_exe_windows_path
+                if not exe:
+                    raise ValueError("Cannot find installed indexer")
+                process = wine.run_wine_application(
+                    app=self.app,
+                    wine_binary=self.app.conf.wine_binary,
+                    exe=exe
+                )
+                if process is None:
+                    raise RuntimeError("Could not start the indexer")
+                self.processes[exe] = process
+                self.indexing_state = State.RUNNING
+                started = time.monotonic()
+                while True:
+                    try:
+                        returncode = process.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        elapsed = int(time.monotonic() - started)
+                        self.app.status(f"Indexing is running… (Elapsed Time: {elapsed // 60}m {elapsed % 60}s)")
+                if self._indexing_cancelled.is_set():
+                    self.app.status("Indexing stopped.")
+                elif returncode != 0:
+                    self.app.status(f"Indexing failed (exit code {returncode}).")
+                else:
+                    # Wine may launch another indexer process before its launcher exits.
+                    remaining = system.get_pids(exe)
+                    child_failed = False
+                    while remaining:
+                        finished, remaining = psutil.wait_procs(remaining, timeout=1)
+                        child_failed |= any(getattr(p, 'returncode', None) not in (None, 0) for p in finished)
+                    if self._indexing_cancelled.is_set():
+                        self.app.status("Indexing stopped.")
+                    elif child_failed:
+                        self.app.status("Indexing failed in a child indexer process.")
+                    else:
+                        self.app.status("Indexing has finished.", percent=100)
+            except Exception as error:
+                logging.exception("Indexing failed")
+                self.app.status(f"Indexing failed: {error}")
+            finally:
+                self.indexing_state = State.STOPPED
 
         wine.wineserver_kill(self.app)
         self.app.status("Indexing has begun…", 0)
-        index_thread = self.app.start_thread(run_indexing, daemon_bool=False)
-        self.indexing_state = State.RUNNING
-        self.app.start_thread(
-            check_if_indexing,
-            index_thread,
-            daemon_bool=False
-        )
-        self.app.start_thread(wait_on_indexing, daemon_bool=False)
+        self.app.start_thread(run_indexing, daemon_bool=False)
 
     def stop_indexing(self):
+        self._indexing_cancelled.set()
         self.indexing_state = State.STOPPING
         if self.app:
             pids = []
