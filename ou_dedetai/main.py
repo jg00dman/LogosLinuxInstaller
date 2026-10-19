@@ -160,6 +160,7 @@ def get_parser():
         '--update-latest-appimage', '-U', action='store_true',
         help='Update the to the latest AppImage.',
     )
+    cmd.add_argument('--select-wine', action='store_true', help='Select the Wine runtime for this installation.')
     cmd.add_argument(
         '--set-appimage', nargs=1, metavar=('APPIMAGE_FILE_PATH'),
         help='Update the AppImage symlink. Requires a path.',
@@ -291,6 +292,7 @@ def parse_args(args, parser) -> Tuple[EphemeralConfiguration, Callable[[Ephemera
         'update_installed_app',
         'stop_installed_app',
         'set_appimage',
+        'select_wine',
         'toggle_app_logging',
         'update_self',
         'update_latest_appimage',
@@ -411,6 +413,7 @@ def run(ephemeral_config: EphemeralConfiguration, action: Callable[[EphemeralCon
         'update_installed_app',
         'stop_installed_app',
         'set_appimage',
+        'select_wine',
         'toggle_app_logging',
     ]
     if action.__name__ not in install_required:

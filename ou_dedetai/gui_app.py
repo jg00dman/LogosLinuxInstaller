@@ -86,7 +86,7 @@ class GuiApp(App):
                 title=question,
                 initialdir=Path().home(),
             )
-        return answer
+        return answer or None
 
     def _info(self, message):
         """Display information to the user"""
@@ -643,12 +643,8 @@ class ControlWindow(GuiApp):
         self.root.event_generate(evt)
 
     def set_appimage(self, evt=None):
-        # TODO: Separate as advanced feature.
-        appimage_filename = self.open_file_dialog("AppImage", "AppImage")
-        if not appimage_filename:
-            return
-        self.conf.wine_appimage_path = appimage_filename
-        self.start_thread(self.set_appimage_symlink)
+        from ou_dedetai.runtime import select_runtime
+        self.start_thread(select_runtime, self)
 
     def switch_logging(self, evt=None):
         desired_state = self.gui.loggingstatevar.get()
@@ -739,17 +735,14 @@ class ControlWindow(GuiApp):
     def update_latest_appimage_button(self, evt=None):
         state = None
         msg = None
+        self.gui.set_appimage_button.state(['!disabled' if self.is_installed() else 'disabled'])
+        gui.ToolTip(self.gui.set_appimage_button, f"Current Wine: {self.conf._raw.wine_binary or 'Not selected'}")
         if not self.is_installed():
             state = "disabled"
             msg = "Please install first"
         elif self.conf._raw.wine_binary_code not in ["Recommended", "AppImage", None]:
             state = 'disabled'
             msg = "This button is disabled. The configured install was not created using an AppImage."
-            self.gui.set_appimage_button.state(['disabled'])
-            gui.ToolTip(
-                self.gui.set_appimage_button,
-                "This button is disabled. The configured install was not created using an AppImage."
-            )
         elif self.conf._raw.wine_binary is not None:
             status, _ = utils.compare_recommended_appimage_version(self)
             if status == 0:

@@ -443,6 +443,8 @@ class TUI(App):
         else:
             labels.extend(["Install", "Advanced Install"])
 
+        if self.is_installed():
+            labels.append("Select Wine runtime…")
         labels.extend(["Utilities →", "Wine Config →", "Change Color Scheme", "Get Support", "Exit"])
         return labels
 
@@ -503,6 +505,15 @@ class TUI(App):
 
         elif choice == "Remove Library Catalog":
             control.remove_library_catalog(self)
+
+        elif choice == "Select Wine runtime…":
+            from ou_dedetai.runtime import select_runtime
+            def select():
+                try:
+                    select_runtime(self)
+                finally:
+                    self._ui_call(self.ui.go_to_main_menu)
+            self.start_thread(select)
 
         elif choice.startswith("Wine Config"):
             self.ui.push_screen(

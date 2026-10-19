@@ -269,8 +269,8 @@ class ControlGui(StatusGui):
             text="Update to Latest AppImage"
         )
         self.latest_appimage_button = Button(self, text="Run")
-        self.set_appimage_label = Label(self, text="Set AppImage")
-        self.set_appimage_button = Button(self, text="Run")
+        self.set_appimage_label = Label(self, text="Wine runtime")
+        self.set_appimage_button = Button(self, text="Select…")
         # App logging toggle
         self.loggingstatevar = StringVar(value='Enable')
         self.logging_label = Label(self, text="Toggle app logging")
