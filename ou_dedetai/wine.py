@@ -1,51 +1,58 @@
 from dataclasses import dataclass
 import logging
 import os
-import re
 import shutil
-import signal
 import subprocess
 from pathlib import Path
+from packaging.version import Version
 import tempfile
-from typing import Optional
+from typing import IO, Optional
 
+from ou_dedetai import constants
 from ou_dedetai.app import App
 
 from . import network
 from . import system
 from . import utils
 
-def check_wineserver(app: App):
+def check_wineserver(app: App) -> bool:
     # FIXME: if the wine version changes, we may need to restart the wineserver
     # (or at least kill it). Gotten into several states in dev where this happend
     # Normally when an msi install failed
     try:
-        process = run_wine_proc(app.conf.wineserver_binary, app)
+        process = run_wine_during_install(app, app.conf.wineserver_binary)
         if not process:
             logging.debug("Failed to spawn wineserver to check it")
             return False
-        process.wait()
-        return process.returncode == 0
-    except Exception:
+        # We already check the return code in run_wine_during_install.
+        # If there is a non-zero exit code subprocess.CalledProcessError will be raised
+        return True
+    except subprocess.CalledProcessError:
         return False
 
 
 def wineserver_kill(app: App):
     if check_wineserver(app):
-        process = run_wine_proc(app.conf.wineserver_binary, app, exe_args=["-k"])
+        process = run_wine_during_install(
+            app,
+            app.conf.wineserver_binary,
+            exe_args=["-k"]
+        )
         if not process:
             logging.debug("Failed to spawn wineserver to kill it")
             return False
-        process.wait()
 
 
 def wineserver_wait(app: App):
     if check_wineserver(app):
-        process = run_wine_proc(app.conf.wineserver_binary, app, exe_args=["-w"])
+        process = run_wine_during_install(
+            app,
+            app.conf.wineserver_binary,
+            exe_args=["-w"]
+        )
         if not process:
             logging.debug("Failed to spawn wineserver to wait for it")
             return False
-        process.wait()
 
 
 @dataclass
@@ -55,33 +62,41 @@ class WineRelease:
     release: Optional[str]
 
 
+def get_devel_or_stable(version: str) -> str:
+    # Wine versioning states that x.0 is always stable branch, while x.y is devel.
+    # Ref: https://gitlab.winehq.org/wine/wine/-/wikis/Wine-User's-Guide#wine-from-winehq
+    if version.split('.')[1].startswith('0'):
+        return 'stable'
+    else:
+        return 'devel'
+
+
 # FIXME: consider raising exceptions on error
 def get_wine_release(binary: str) -> tuple[Optional[WineRelease], str]:
     cmd = [binary, "--version"]
     try:
         version_string = subprocess.check_output(cmd, encoding='utf-8').strip()
         logging.debug(f"Version string: {str(version_string)}")
-        release: Optional[str]
+        branch: Optional[str]
         try:
-            version, release = version_string.split()
+            wine_version, branch = version_string.split()  # release = (Staging)
+            branch = branch.lstrip('(').rstrip(')').lower()  # remove parens
         except ValueError:
             # Neither "Devel" nor "Stable" release is noted in version output
-            version = version_string
-            release = get_wine_branch(binary)
+            wine_version = version_string
+            branch = get_devel_or_stable(wine_version)
+        version = wine_version.lstrip('wine-')
+        logging.debug(f"Wine branch of {binary}: {branch}")
 
-        logging.debug(f"Wine branch of {binary}: {release}")
+        ver_major = int(version.split('.')[0].lstrip('wine-'))  # remove 'wine-'
+        ver_minor_str = version.split('.')[1]
+        # In the case the version is an rc like wine-10.0-rc5
+        if '-' in ver_minor_str:
+            ver_minor_str = ver_minor_str.split("-")[0]
+        ver_minor = int(ver_minor_str)
 
-        if release is not None:
-            ver_major = int(version.split('.')[0].lstrip('wine-'))  # remove 'wine-'
-            ver_minor = int(version.split('.')[1])
-            release = release.lstrip('(').rstrip(')').lower()  # remove parens
-        else:
-            ver_major = 0
-            ver_minor = 0
-
-        wine_release = WineRelease(ver_major, ver_minor, release)
+        wine_release = WineRelease(ver_major, ver_minor, branch)
         logging.debug(f"Wine release of {binary}: {str(wine_release)}")
-
         if ver_major == 0:
             return None, "Couldn't determine wine version."
         else:
@@ -115,22 +130,26 @@ def check_wine_rules(
     # commits in time.
     logging.debug(f"Checking {wine_release} for {release_version}.")
     if faithlife_product_version == "10":
-        if release_version is not None and utils.check_logos_release_version(release_version, 30, 1): #noqa: E501
+        if release_version is not None and Version(release_version) < Version("30.0.0.0"): 
             required_wine_minimum = [7, 18]
         else:
             required_wine_minimum = [9, 10]
     elif faithlife_product_version == "9":
         required_wine_minimum = [7, 0]
     else:
-        raise ValueError(f"Invalid target version, expecting 9 or 10 but got: {faithlife_product_version} ({type(faithlife_product_version)})")  # noqa: E501
+        raise ValueError(
+            "Invalid target version, expecting 9 or 10 but got: "
+            f"{faithlife_product_version} ({type(faithlife_product_version)})"
+        )
 
     rules: list[WineRule] = [
-        # Proton release tend to use the x.0 release, but can include changes found in devel/staging  # noqa: E501
+        # Proton release tend to use the x.0 release, but can include changes found in devel/staging
         # exceptions to minimum
         WineRule(major=7, proton=True, minor_bad=[], allowed_releases=["staging"]),
         # devel permissible at this point
-        WineRule(major=8, proton=False, minor_bad=[0], allowed_releases=["staging"], devel_allowed=16), #noqa: E501
-        WineRule(major=9, proton=False, minor_bad=[], allowed_releases=["devel", "staging"]) #noqa: E501
+        WineRule(major=8, proton=False, minor_bad=[0], allowed_releases=["staging"], devel_allowed=16), 
+        WineRule(major=9, proton=False, minor_bad=[], allowed_releases=["devel", "staging"]),  
+        WineRule(major=10, proton=False, minor_bad=[], allowed_releases=["stable", "devel", "staging"]) 
     ]
 
     major_min, minor_min = required_wine_minimum
@@ -157,7 +176,7 @@ def check_wine_rules(
                         result = (
                             False,
                             (
-                                f"Wine release needs to be {rule.allowed_releases}. "  # noqa: E501
+                                f"Wine release needs to be {rule.allowed_releases}. "
                                 f"Current release: {release_type}."
                             )
                         )
@@ -180,7 +199,7 @@ def check_wine_rules(
                             False,
                             (
                                 f"Wine version {major}.{minor} is "
-                                f"below minimum required ({major_min}.{minor_min}).")  # noqa: E501
+                                f"below minimum required ({major_min}.{minor_min}).")
                         )
                         break
         logging.debug(f"Result: {result}")
@@ -218,67 +237,252 @@ def check_wine_version_and_branch(release_version: Optional[str], test_binary,
     return True, "None"
 
 
-def initializeWineBottle(wine64_binary: str, app: App) -> Optional[subprocess.Popen[bytes]]: #noqa: E501
+def initializeWineBottle(wine64_binary: str, app: App):
     app.status("Initializing wine bottle…")
     logging.debug(f"{wine64_binary=}")
     # Avoid wine-mono window
     wine_dll_override="mscoree="
     logging.debug(f"Running: {wine64_binary} wineboot --init")
-    process = run_wine_proc(
-        wine64_binary,
+    run_wine_during_install(
         app=app,
+        wine_binary=wine64_binary,
         exe='wineboot',
         exe_args=['--init'],
         init=True,
         additional_wine_dll_overrides=wine_dll_override
     )
-    return process
 
 
-def wine_reg_install(app: App, reg_file, wine64_binary):
-    reg_file = str(reg_file)
-    app.status(f"Installing registry file: {reg_file}")
-    process = run_wine_proc(
-        wine64_binary,
+def set_win_version(app: App, exe: str, windows_version: str):
+    if exe == "logos":
+        # This operation is equivilent to f"winetricks -q settings {windows_version}"
+        # but faster
+        run_wine_during_install(
+            app,
+            app.conf.wine_binary,
+            exe_args=('winecfg', '/v', windows_version)
+        )
+
+    elif exe == "indexer":
+        reg = f"HKCU\\Software\\Wine\\AppDefaults\\{app.conf.faithlife_product}Indexer.exe"
+        exe_args = [
+            'add',
+            reg,
+            "/v", "Version",
+            "/t", "REG_SZ",
+            "/d", f"{windows_version}", "/f",
+            ]
+        process = run_wine_during_install(
+            app,
+            app.conf.wine_binary,
+            exe='reg',
+            exe_args=exe_args
+        )
+        if process is None:
+            app.exit("Failed to spawn command to set windows version for indexer")
+
+
+def wine_reg_query(app: App, key_name: str, value_name: str) -> Optional[str]:
+    """Query the registry
+
+    Example command and output:
+
+    ```    
+    $ wine reg query "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" /v "Arial (TrueType)"
+
+    HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts
+        Arial (TrueType)    REG_SZ    Z:\\usr\\share\\fonts\\truetype\\msttcorefonts\\Arial.ttf
+
+    ```
+    """
+    process = run_wine_completed_process(
         app=app,
-        exe="regedit.exe",
-        exe_args=[reg_file]
+        wine_binary=app.conf.wine64_binary,
+        exe="reg.exe",
+        exe_args=[
+            "query",
+            key_name,
+            "/v",
+            value_name
+        ]
     )
-    # NOTE: For some reason waiting on this processes results in the reg install failing
-    if process is None:
-        app.exit("Failed to spawn command to install reg file")
-    process.wait()
-    if process is None or process.returncode != 0:
-        failed = "Failed to install reg file"
-        logging.debug(f"{failed}. {process=}")
-        app.exit(f"{failed}: {reg_file}")
+    if process.returncode == 1:
+        # Key not found
+        return None
     elif process.returncode == 0:
-        logging.info(f"{reg_file} installed.")
-    wineserver_wait(app)
+        # Parse output?
+        for line in process.stdout.rstrip().splitlines():
+            # If line is empty that's not what we're looking for
+            if not line:
+                continue
+            if line.strip() == key_name:
+                continue
+            if line.lstrip().startswith(value_name) and "REG_SZ" in line:
+                # This is the line in question
+                return line.split(value_name)[1].split("REG_SZ")[1].strip()
+        logging.warning(f"Failed to parse the registry query: {process.stdout.rstrip()}") 
+        return None
+    else:
+        # Unknown exit code
+        failed = f"Failed to query the registry: Unknown Exit code {process.returncode}"
+        logging.debug(f"{failed}. {process=}")
+        app.exit(f"{failed}: {key_name} {value_name}")
+
+
+def wine_reg_install(app: App, name: str, reg_text: str, wine64_binary: str):
+    with tempfile.TemporaryDirectory() as tempdir:
+        reg_file = Path(tempdir) / name
+        reg_file.write_text(reg_text)
+        app.status(f"Installing registry file: {reg_file}")  
+        try:
+            process = run_wine_during_install(
+                app=app,
+                wine_binary=wine64_binary,
+                exe="regedit.exe",
+                exe_args=[str(reg_file)]
+            )
+            if process is None:
+                app.exit("Failed to spawn command to install reg file")
+            logging.info(f"{reg_file} installed.")
+            wineserver_wait(app)
+        except subprocess.CalledProcessError:
+            failed = "Failed to install reg file"
+            logging.exception(f"{failed}. {process=}")
+            app.exit(f"{failed}: {reg_file}")
+        finally:
+            reg_file.unlink()
 
 
 def disable_winemenubuilder(app: App, wine64_binary: str):
-    workdir = tempfile.mkdtemp()
-    reg_file = Path(workdir) / 'disable-winemenubuilder.reg'
-    reg_file.write_text(r'''REGEDIT4
+    name='disable-winemenubuilder.reg'
+    reg_text = r'''REGEDIT4
 
 [HKEY_CURRENT_USER\Software\Wine\DllOverrides]
 "winemenubuilder.exe"=""
-''')
-    wine_reg_install(app, reg_file, wine64_binary)
-    shutil.rmtree(workdir)
+'''
+    wine_reg_install(app, name, reg_text, wine64_binary)
+
+
+def set_renderer(app: App, wine64_binary: str, value: str):
+    name=f'set-renderer-to-{value}.reg'
+    reg_text = rf'''REGEDIT4
+
+[HKEY_CURRENT_USER\Software\Wine\Direct3D]
+"renderer"="{value}"
+'''
+    wine_reg_install(app, name, reg_text, wine64_binary)
+
+
+def set_fontsmoothing_to_rgb(app: App, wine64_binary: str):
+    # Possible registry values:
+    # "disable":      FontSmoothing=0; FontSmoothingOrientation=1; FontSmoothingType=0
+    # "gray/grey":    FontSmoothing=2; FontSmoothingOrientation=1; FontSmoothingType=1
+    # "bgr":          FontSmoothing=2; FontSmoothingOrientation=0; FontSmoothingType=2
+    # "rgb":          FontSmoothing=2; FontSmoothingOrientation=1; FontSmoothingType=2
+    # https://github.com/Winetricks/winetricks/blob/8cf82b3c08567fff6d3fb440cbbf61ac5cc9f9aa/src/winetricks#L17411
+
+    name='set-fontsmoothing-to-rgb.reg'
+    reg_text = r'''REGEDIT4
+
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+"FontSmoothing"="2"
+"FontSmoothingGamma"=dword:00000578
+"FontSmoothingOrientation"=dword:00000001
+"FontSmoothingType"=dword:00000002
+'''
+    wine_reg_install(app, name, reg_text, wine64_binary)
 
 
 def install_msi(app: App):
     app.status(f"Running MSI installer: {app.conf.faithlife_installer_name}.")
-    # Execute the .MSI
-    wine_exe = app.conf.wine64_binary
-    exe_args = ["/i", f"{app.conf.install_dir}/data/{app.conf.faithlife_installer_name}"] #noqa: E501
-    if app.conf._overrides.faithlife_install_passive is True:
-        exe_args.append('/passive')
-    logging.info(f"Running: {wine_exe} msiexec {' '.join(exe_args)}")
-    process = run_wine_proc(wine_exe, app, exe="msiexec", exe_args=exe_args)
-    return process
+    # Define the Wine executable and initial arguments for msiexec
+    wine_binary = app.conf.wine64_binary
+    exe_args = ["/i", f"{app.conf.install_dir}/data/{app.conf.faithlife_installer_name}"]
+
+    # Ensure the user agrees to the EULA. Exit if they don't.
+    # This code block tells the MSI installer to run non-interactively.
+    # There have been 2 reports in the wild, once on ctrlalt24's computer and on Itsjoe
+    # where the installer wouldn't launch interactively.
+    # Since the launcher only prompts for EULA, and askes where to install 
+    # (which is pointless as it's in it's own wine prefix), we can just skip the interaction
+    # entirely once we confirm the user has agreed to EULA (for Faithlife's sake)
+    if (
+        app.conf._overrides.agreed_to_faithlife_terms or
+        app.approve_or_exit("Do you agree to Faithlife's EULA? https://faithlife.com/terms")
+    ):
+        exe_args.append("/passive")
+
+    # Add MST transform if needed
+    release_version = app.conf.installed_faithlife_product_release or app.conf.faithlife_product_release
+    if release_version is not None and Version(release_version) > Version("39.0.0.0"): 
+        # Define MST path and transform to windows path.
+        mst_path = constants.APP_ASSETS_DIR / "LogosStubFailOK.mst"
+        transform_winpath = run_wine_completed_process(
+            app=app,
+            wine_binary=wine_binary,
+            exe_args=['winepath', '-w', mst_path]
+        ).stdout.rstrip()
+        exe_args.append(f'TRANSFORMS={transform_winpath}')
+        logging.debug(f"TRANSFORMS windows path added: {transform_winpath}")
+
+    # Log the msiexec command and run the process
+    logging.info(f"Running: {wine_binary} msiexec {' '.join(exe_args)}")
+    result = run_wine_during_install(app, wine_binary, exe="msiexec", exe_args=exe_args)
+    if result is not None:
+        # Wait in order to get the exit status.
+        result.wait()
+    if result is None or result.returncode != 0:
+        app.exit("Logos Installer failed.") 
+    return result
+
+
+def run_winetricks(app: App, *args):
+    cmd = [*args]
+    if "-q" not in args and app.conf.winetricks_binary:
+        cmd.insert(0, "-q")
+    logging.info(f"running \"winetricks {' '.join(cmd)}\"")
+    try:
+        process = run_wine_during_install(app, app.conf.winetricks_binary, exe_args=cmd)
+        if process is None:
+            app.exit("Failed to spawn winetricks")
+    except subprocess.CalledProcessError:
+        logging.exception(f"\"winetricks {' '.join(cmd)}\" Failed!")
+        app.exit(f"\"winetricks {' '.join(cmd)}\" Failed!")
+    logging.info(f"\"winetricks {' '.join(cmd)}\" DONE!")
+    logging.debug(f"procs using {app.conf.wine_prefix}:")
+    for proc in utils.get_procs_using_file(app.conf.wine_prefix):
+        logging.debug(f"winetricks proc: {proc=}")
+    else:
+        logging.debug('winetricks proc: <None>')
+
+
+def install_fonts(app: App):
+    """Installs all required fonts:
+    
+    - arial
+    """
+    fonts_dir = Path(app.conf.wine_prefix) / "drive_c" / "windows" / "Fonts"
+    fonts = ["arial"]
+    for i, f in enumerate(fonts):
+        registry_key = wine_reg_query(
+            app,
+            "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts", 
+            f"{f.capitalize()} (TrueType)"
+        )
+        if registry_key is not None and registry_key != f"{f}.ttf":
+            # Can hit this case with the debian package ttf-mscorefonts-installer
+            logging.debug(f"Found font {f} already installed by other means, no need to install.") 
+            continue
+        # This case doesn't happen normally, but still good to check.
+        # Now we need to check to see if there is a registry key saying it's in Fonts
+        # but in reality it's not.
+        if registry_key == f"{f}.ttf" and (fonts_dir / f"{f}.ttf").exists():
+            logging.debug(f"Found font {f} already in fonts dir, no need to install.")
+            continue
+        # Font isn't installed, continue to install with winetricks.
+        app.status(f"Configuring font: {f}…", i / len(fonts))
+        args = [f]
+        run_winetricks(app, *args)
 
 
 def get_winecmd_encoding(app: App) -> Optional[str]:
@@ -298,141 +502,169 @@ def get_winecmd_encoding(app: App) -> Optional[str]:
         return None
 
 
-def run_wine_proc(
-    winecmd,
+def run_wine_completed_process(
     app: App,
+    wine_binary: str,
     exe=None,
-    exe_args=list(),
-    init=False,
-    additional_wine_dll_overrides: Optional[str] = None
-) -> Optional[subprocess.Popen[bytes]]:
-    logging.debug("Getting wine environment.")
-    env = get_wine_env(app, additional_wine_dll_overrides)
-    if isinstance(winecmd, Path):
-        winecmd = str(winecmd)
-    logging.debug(f"run_wine_proc: {winecmd}; {exe=}; {exe_args=}")
+    exe_args=None,
+    additional_wine_dll_overrides: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Like run_wine_proc but outputs a CompletedProcess
+    and sets it's output to text
 
-    command = [winecmd]
+    Useful when wanting to parse the output for wine commands
+    """
+    env = get_wine_env(app, additional_wine_dll_overrides)
+    command = [wine_binary]
+    if exe is not None:
+        command.append(exe)
+    if exe_args:
+        command.extend(exe_args)
+    return subprocess.run(
+        command,
+        env=system.fix_ld_library_path(env),
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_wine_process(
+    app: App,
+    wine_binary: str | Path,
+    stdout: IO[str],
+    stderr: IO[str],
+    stdin = None,
+    exe=None,
+    exe_args=None,
+    additional_wine_dll_overrides: Optional[str] = None,
+) -> Optional[subprocess.Popen[bytes]]:
+    """Runs wine directly
+    
+    Args:
+    - app: App
+    - stdout: Where to send stdout, must be a file descriptor
+    - stderr: Where to send stderr, must be a file descriptor
+    - stderr: Where stdin should come from, must be a file descriptor
+    - exe: The windows executable to run
+    - exe_args: arguments to the aforementioned exe
+    - init: whether or not this call is to initialize the bottle
+    - additional_wine_dll_overrides: Add to WINEDLLOVERRIDES
+    """
+    env = get_wine_env(app, additional_wine_dll_overrides)
+    if isinstance(wine_binary, Path):
+        wine_binary = str(wine_binary)
+
+    command = [wine_binary]
     if exe is not None:
         command.append(exe)
     if exe_args:
         command.extend(exe_args)
 
-    cmd = f"subprocess cmd: '{' '.join(command)}'"
+    cmd = f"Running wine cmd: '{' '.join(command)}'"
     logging.debug(cmd)
     try:
-        with open(app.conf.app_wine_log_path, 'a') as wine_log:
-            print(f"{utils.get_timestamp()}: {cmd}", file=wine_log)
-            process = system.popen_command(
-                command,
-                stdout=wine_log,
-                stderr=wine_log,
-                env=env,
-                start_new_session=True
-            )
-            if process is not None:
-                if process.poll() is None and process.stdout is not None:
-                    with process.stdout:
-                        for line in iter(process.stdout.readline, b''):
-                            if winecmd.endswith('winetricks'):
-                                logging.debug(line.decode('cp437').rstrip())
-                            else:
-                                try:
-                                    logging.info(line.decode().rstrip())
-                                except UnicodeDecodeError:
-                                    if not init and app.conf.wine_output_encoding is not None: # noqa: E501
-                                        logging.info(line.decode(app.conf.wine_output_encoding).rstrip())  # noqa: E501
-                                    else:
-                                        logging.error("wine.run_wine_proc: Error while decoding: wine output encoding could not be found.")  # noqa: E501
-                return process
-            else:
-                return None
+        stdout.write(f"{utils.get_timestamp()}: {cmd}\n")
+        # FIXME: consider calling Popen directly here so we can remove the
+        # run_wine_proc_completed_process function - as it is nearly a duplicate
+        # of this one, but with a different arg to Popen.
+        return system.popen_command(
+            command,
+            stdout=stdout,
+            stderr=stderr,
+            stdin=stdin,
+            env=env,
+            start_new_session=True,
+            encoding='utf-8'
+        )
 
     except subprocess.CalledProcessError as e:
         logging.error(f"Exception running '{' '.join(command)}': {e}")
-
-    return process
-
-
-def run_winetricks(app: App, *args):
-    cmd = [*args]
-    if "-q" not in args and app.conf.winetricks_binary:
-        cmd.insert(0, "-q")
-    logging.info(f"running \"winetricks {' '.join(cmd)}\"")
-    process = run_wine_proc(app.conf.winetricks_binary, app, exe_args=cmd)
-    if process is None:
-        app.exit("Failed to spawn winetricks")
-    process.wait()
-    logging.info(f"\"winetricks {' '.join(cmd)}\" DONE!")
-    wineserver_wait(app)
-    logging.debug(f"procs using {app.conf.wine_prefix}:")
-    for proc in utils.get_procs_using_file(app.conf.wine_prefix):
-        logging.debug(f"{proc=}")
-    else:
-        logging.debug('<None>')
+    return None
 
 
-def install_d3d_compiler(app: App):
-    cmd = ['d3dcompiler_47']
-    run_winetricks(app, *cmd)
+def run_wine_application(
+    app: App,
+    wine_binary: str | Path,
+    exe=None,
+    exe_args=None,
+    additional_wine_dll_overrides: Optional[str] = None,
+) -> Optional[subprocess.Popen[bytes]]:
+    """Run a wine application.
+     
+    Store the log in a dedicated file, keeping the previous log.
+    """
+    current_log_path = Path(app.conf.app_wine_log_path)
+    previous_log_path = Path(app.conf.app_wine_log_previous_path)
+    if current_log_path.exists():
+        shutil.move(current_log_path, previous_log_path)
+    with open(current_log_path, 'w') as wine_log:
+        return run_wine_process(
+            app=app,
+            wine_binary=wine_binary,
+            stdout=wine_log,
+            stderr=wine_log,
+            exe=exe,
+            exe_args=exe_args,
+            additional_wine_dll_overrides=additional_wine_dll_overrides
+        )
 
 
-def install_fonts(app: App):
-    fonts = ['corefonts', 'tahoma']
-    if not app.conf.skip_install_fonts:
-        for i, f in enumerate(fonts):
-            app.status(f"Configuring font: {f}…", i / len(fonts)) # noqa: E501
-            args = [f]
-            run_winetricks(app, *args)
-
-
-def install_font_smoothing(app: App):
-    logging.info("Setting font smoothing…")
-    args = ['settings', 'fontsmooth=rgb']
-    run_winetricks(app, *args)
-
-
-def set_renderer(app: App, renderer: str):
-    run_winetricks(app, "-q", "settings", f"renderer={renderer}")
-
-
-def set_win_version(app: App, exe: str, windows_version: str):
-    if exe == "logos":
-        # This operation is equivilent to f"winetricks -q settings {windows_version}"
-        # but faster
-        process = run_wine_proc(
-            app.conf.wine_binary,
-            app,
-            exe_args=('winecfg', '/v', windows_version)
+def run_wine_during_install(
+    app: App,
+    wine_binary: str | Path,
+    exe=None,
+    exe_args=list(),
+    init=False,
+    additional_wine_dll_overrides: Optional[str] = None,
+) -> Optional[subprocess.Popen[bytes]]:
+    """Runs a wine process as part of the install process.
+    Waits for wine to complete before returning.
+    Checks exit code to ensure it is 0
+    
+    Logs are dumped in the python logger (subject to their rotation).
+    This function also waits on the process to finish.
+    
+    Raises:
+    - subprocess.CalledProcessError if returncode != 0
+    """
+    with tempfile.NamedTemporaryFile(mode="w+") as temp_file:
+        process = run_wine_process(
+            app=app,
+            wine_binary=wine_binary,
+            stdout=temp_file,
+            stderr=temp_file,
+            exe=exe,
+            exe_args=exe_args,
+            additional_wine_dll_overrides=additional_wine_dll_overrides
         )
         if process:
+            if exe:
+                full_command_string = f"{wine_binary} {exe} {" ".join(exe_args)}"
+            else:
+                full_command_string = f"{wine_binary} {" ".join(exe_args)}"
+            logging.debug(f"Waiting on: {full_command_string}")
             process.wait()
-
-    elif exe == "indexer":
-        reg = f"HKCU\\Software\\Wine\\AppDefaults\\{app.conf.faithlife_product}Indexer.exe"  # noqa: E501
-        exe_args = [
-            'add',
-            reg,
-            "/v", "Version",
-            "/t", "REG_SZ",
-            "/d", f"{windows_version}", "/f",
-            ]
-        process = run_wine_proc(
-            app.conf.wine_binary,
-            app,
-            exe='reg',
-            exe_args=exe_args
-        )
-        if process is None:
-            app.exit("Failed to spawn command to set windows version for indexer")
-        process.wait()
+            logging.debug(f"Wine process {full_command_string} "
+                          f"completed with: {process.returncode}. "
+                          "Dumping log:")
+            # Now read from the tempfile and echo into our application log.
+            with open(temp_file.name, "r") as temp_log_file:
+                while line := temp_log_file.readline():
+                    logging.debug(f"> {line.rstrip()}")
+            logging.debug(f"Finished dumping log {full_command_string}")
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    process.returncode,
+                    cmd=full_command_string,
+                )
+    return process
 
 
 # FIXME: Consider when to re-run this if it changes.
 # Perhaps we should have a "apply installation updates"
 # or similar mechanism to ensure all of our latest methods are installed
-# including but not limited to: system packages, winetricks options,
-# icu files, fonts, registry edits, etc.
+# including but not limited to: system packages, icu files, fonts, registry
+# edits, etc.
 #
 # Seems like we want to have a more holistic mechanism for ensuring
 # all users use the latest and greatest.
@@ -466,10 +698,9 @@ def enforce_icu_data_files(app: App):
     app.status("ICU files copied.", 100)
 
 
-
 def get_registry_value(reg_path, name, app: App):
     logging.debug(f"Get value for: {reg_path=}; {name=}")
-    # FIXME: consider breaking run_wine_proc into a helper function before decoding is attempted # noqa: E501
+    # FIXME: consider breaking run_wine_proc into a helper function before decoding is attempted
     # NOTE: Can't use run_wine_proc here because of infinite recursion while
     # trying to determine wine_output_encoding.
     value = None
@@ -504,63 +735,11 @@ def get_registry_value(reg_path, name, app: App):
     return value
 
 
-def get_mscoree_winebranch(mscoree_file: Path) -> Optional[str]:
-    try:
-        with mscoree_file.open('rb') as f:
-            for line in f:
-                m = re.search(rb'wine-[a-z]+', line)
-                if m is not None:
-                    return m[0].decode().lstrip('wine-')
-    except FileNotFoundError as e:
-        logging.error(e)
-    return None
-
-
-def get_wine_branch(binary: str) -> Optional[str]:
-    logging.info(f"Determining wine branch of '{binary}'")
-    binary_obj = Path(binary).expanduser().resolve()
-    if utils.check_appimage(binary_obj):
-        logging.debug(f"Mounting AppImage: {binary_obj}")
-        # Mount appimage to inspect files.
-        p = subprocess.Popen(
-            [binary_obj, '--appimage-mount'],
-            stdout=subprocess.PIPE,
-            encoding='UTF8'
-        )
-        branch = None
-        while p.returncode is None and p.stdout is not None:
-            for line in p.stdout:
-                if line.startswith('/tmp'):
-                    tmp_dir = Path(line.rstrip())
-                    for f in tmp_dir.glob('org.winehq.wine.desktop'):
-                        if not branch:
-                            for dline in f.read_text().splitlines():
-                                try:
-                                    k, v = dline.split('=')
-                                except ValueError:  # not a key=value line
-                                    continue
-                                if k == 'X-AppImage-Version':
-                                    branch = v.split('_')[0]
-                                    logging.debug(f"{branch=}")
-                                    break
-                p.send_signal(signal.SIGINT)
-            p.poll()
-        return branch
-    else:
-        logging.debug("Binary object is not an AppImage.")
-    logging.info(f"'{binary}' resolved to '{binary_obj}'")
-    mscoree64 = binary_obj.parents[1] / 'lib64' / 'wine' / 'x86_64-windows' / 'mscoree.dll'  # noqa: E501
-    if not mscoree64.exists():  #alpine
-        mscoree64 = binary_obj.parents[1] / 'lib' / 'wine' / 'x86_64-windows' / 'mscoree.dll'  # noqa: E501
-    return get_mscoree_winebranch(mscoree64)
-
-
-def get_wine_env(app: App, additional_wine_dll_overrides: Optional[str]=None):
+def get_wine_env(app: App, additional_wine_dll_overrides: Optional[str]=None) -> dict[str, str]: 
+    logging.debug("Getting wine environment.")
     wine_env = os.environ.copy()
     winepath = Path(app.conf.wine_binary)
     if winepath.name != 'wine64':  # AppImage
-        # Winetricks commands can fail if 'wine64' is not explicitly defined.
-        # https://github.com/Winetricks/winetricks/issues/2084#issuecomment-1639259359
         winepath = Path(app.conf.wine64_binary)
     wine_env_defaults = {
         'WINE': str(winepath),
@@ -569,17 +748,14 @@ def get_wine_env(app: App, additional_wine_dll_overrides: Optional[str]=None):
         'WINELOADER': str(winepath),
         'WINEPREFIX': app.conf.wine_prefix,
         'WINESERVER': app.conf.wineserver_binary,
-        # The following seems to cause some winetricks commands to fail; e.g.
-        # 'winetricks settings win10' exits with ec = 1 b/c it fails to find
-        # %ProgramFiles%, %AppData%, etc.
-        # 'WINETRICKS_SUPER_QUIET': '',
     }
     for k, v in wine_env_defaults.items():
         wine_env[k] = v
 
     if additional_wine_dll_overrides is not None:
-        wine_env["WINEDLLOVERRIDES"] += ";" + additional_wine_dll_overrides # noqa: E501
+        wine_env["WINEDLLOVERRIDES"] += ";" + additional_wine_dll_overrides
 
     updated_env = {k: wine_env.get(k) for k in wine_env_defaults.keys()}
     logging.debug(f"Wine env: {updated_env}")
-    return wine_env
+    # Extra safe calling this here, it should be called run run_command anyways
+    return system.fix_ld_library_path(wine_env)

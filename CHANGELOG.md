@@ -1,12 +1,87 @@
 # Changelog
 
+- 4.0.0-beta.15
+	- Fix issues with TUI [J. Bellars, T. H. Wright]
+	- Switch TUI to Textual [T. H. Wright]
+- 4.0.0-beta.14
+	- This release adds an update Logos button [N. Shaaban]
+	- OD now detects OpenGL version [T. H. Wright]
+	- Various bugs and AI agent files [N. Shaaban]
+- 4.0.0-beta.13
+	- This release fixes some bugs found since beta 12. [N. Shaaban]
+	- This release also adds some initial support for containerized browsers. [N. Shaaban]
+- 4.0.0-beta.12
+	- This release fixes numerous small issues that prevented working installs, while also introducing numerous small UX improvements [N. Shaaban, N. Marti, T. H. Wright, DavidDGTNT, Simpleboy0]
+	- This release fixes a critical issue with beta 11 [N. Shaaban]
+	- This release supports the Logos 41+ login flow [N. Shaaban]
+- 4.0.0-beta.11
+	- Fixes bug where the TUI didn't open (#379, #382) [N. Shaaban, T. H. Wright]
+	- Fixes bug where Verbum didn't stop when told (#374) [N. Shaaban]
+	- Functionality restored to Backup/Restore on CLI (#345) [N. Marti]
+	- Properly rotate wine.log (#378, #376) [N. Shaaban]
+	- Adds proper progress bar to CLI (#370) [N. Shaaban]
+- 4.0.0-beta.10
+	- Fixes bug where advanced GUI install failed (#354) [N. Shaaban]
+	- Adds a new option: "Get Support" to create a zip and display our social groups (#353, #274, #103) [N. Shaaban]
+	- Adds a new option: "Uninstall" to remove all the directories/files we use. **Replaces the cli option --remove-install-dir with --uninstall.** Requires a successful install for option to be present on TUI/GUI for now. (#233, #362) [N. Shaaban]
+	- Fixes bug with latest staging wine that doesn't include a wine64 binary (#350, #352) [N. Shaaban]
+	- Fixes legacy config migration (#320) [N. Shaaban]
+	- Allows user to go back to the main menu in some circumstances (#355) [N. Shaaban]
+	- Add Github actions for snap build (#343) [N. Shaaban]
+	- Move progress bar as files are downloaded (#364) [N. Shaaban]
+	- Add a simple Install option to the TUI to match GUI (#341) [T. H. Wright]
+	- Fixes misc bugs where versions we not being compared properly, resulted in a failed install for one user (#359) [N. Shaaban]
+	- Fixes Manjaro 7zip package name (#361) [T. H. Wright]
+	- Fixes bug where a custom XDG_DATA_DIR wasn't creating the FaithLife-Community subfolder (#358) [N. Shaaban]
+	- Adds extra line to the footer of the TUI (also refactor TUI splitting into header/footer) (#343, #342) [T. H. Wright]
+- 4.0.0-beta.9
+	- **Change default install dir to $XDG_DATA_HOME/FaithLife-Community/oudedetai (this will be ~/.local/share/FaithLife-Community/oudedetai on most systems). To restore the old behavior: `export INSTALLDIR=$HOME/LogosBible10` (#323) [T. H. Wright]**
+	- **Fixes crash in "Copy Bible Verse" and when first hitting "Continue" due to missing arial font (#335) [N. Shaaban]**
+	- Adds WINEDEBUG flags when --debug cli argument is passed (#346) [N. Shaaban]
+	- Fixes typo in default WINEDEBUG (#326) [T. H. Wright]
+	- Respects DIALOG even when specifying --install-app (#332) (useful for snap/flatpak) [N. Shaaban]
+	- Remove Logos 9 support (#322 #53) [T. H. Wright, N. Marti, N. Shaaban]
+	- Remove support for alpine appimage - use system wine instead. (#294) [T. H. Wright]
+	- Fixes disappearing TUI lines when window is somewhat small (#303) [T. H. Wright]
+	- Write a second copy of the config file into install_dir (#327) [T. H. Wright]
+	- Wraps GUI progress bar messages (#336, #312) [N. Shaaban]
+	- Ensures user agrees to the faithlife EULA when -y or --passive is passed (#241, #331) [N. Shaaban]
+	- Fixes bug where "Install" button stays greyed out on first install (#333, #334) [N. Shaaban]
+	- Start adding unittests (#337) [N. Marti]
+- 4.0.0-beta.8 (YANKED due to missing arial font #335)
+	- Fix dynamic linking in subprocess calls. (#292 #293) [N. Shaaban]
+	- Remove need for manual dependency installation on arch/~~alpine~~/fedora (#143 #236 #293). Alpine still needs to be fixed [N. Shaaban]
+	- Fixes wine binary installations (#286 #288) [N. Marti]
+	- Removed need for winetricks, and removed it's subcommand. Added a wine subcommand (#254 #170 #177 #258 #267) [N. Marti]
+	- Fix wine version parsing when wine is compiled manually (#291) [N. Marti]
+	- Fix setting TUI Color scheme (#259 #297 #278 #302)  [T. H. Wright, N. Shaaban]
+	- Create snap definition (#239 #298) [N. Marti]
+	- Create a flatpak definition (#309 #307) [N. Shaaban]
+	- Default downloads to XDG_CACHE_HOME rather than ~/Downloads (#237 #298) [N. Marti]
+	- Fixes issue where WINE_EXE isn't respect on clean installs (#306) [N. Shaaban]
+	- Added nix-shell for running from source on NixOS. Desktop shortcuts won't get created. (#306) [N. Shaaban]
+	- Remove "Running Logos" status message in the TUI so menu is still interactive after starting Logos (#302) [N. Shaaban]
+	- Handle resize in more cases on the TUI (#304) [N. Shaaban]
+- 4.0.0-beta.7
+	- Fix appimage update button to accept wine 10 (#282, #275) [N. Marti]
+	- Fix crash when downloading resources (seqURIs must be non-null and non-empty) (#275 #262 #283) [N. Shaaban]
 - 4.0.0-beta.6
+	- Fix #256 [J. Goodman]
+	- Fix #269 [T. H. Wright]
+	- Fix #234 [N. Shaaban]
+	- Fix #187 [N. Shaaban]
+	- Fix #168 [N. Shaaban]
+	- Fix #155 [N. Shaaban]
+	- Fix #147 [N. Shaaban]
+	- Fix #253 [N. Marti]
+	- Fix #252 [N. Marti]
 	- Implemented network cache [N. Shaaban]
 	- Refactored configuration handling (no user action required) [N. Shaaban]
+  	- Fix #235 [T. H. Wright]
 - 4.0.0-beta.5
 	- Filter out broken Logos v39 release [N. Shaaban]
 	- Fix #17 [T. H. Wright]
-	- Make dependency lists more precise [M. Marti, N. Shaaban]
+	- Make dependency lists more precise [N. Marti, N. Shaaban]
 	- Fix #230 [N. Shaaban]
 - 4.0.0-beta.4
 	- Fix #220 [N. Shaaban]

@@ -13,8 +13,10 @@ dependencies = [
     "psutil",
     "pythondialog",
     "requests",
+    "inotify", # Required for watching when the auto-update setting changes
 #    "tkinter",  # actually provided by a system package, not a python package
 #    "urllib3",
+	"textual",
 ]
 name = "ou_dedetai"
 dynamic = ["readme", "version"]
@@ -22,6 +24,7 @@ requires-python = ">=3.12"
 
 [project.optional-dependencies]
 build = ["pyinstaller"]
+dev = ["mypy", "ruff"]
 
 [project.scripts]
 oudedetai = "ou_dedetai.main:main"
@@ -35,6 +38,9 @@ where = ["."]
 
 [tool.setuptools.package-data]
 "ou_dedetai.img" = ["*icon.png"]
+
+[tool.ruff]
+line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F"]

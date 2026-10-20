@@ -1,0 +1,164 @@
+name: oudedetai
+base: core24
+adopt-info: oudedetai
+summary: Install and maintain FaithLife's proprietary Logos Bible (Verbum) Software.
+description: |
+  A Python program for installing and maintaining FaithLife's Logos Bible (Verbum) Software on Linux.
+
+  NOTE: The way this app manages multiple executables is currently incompatible with snap confinement policy. Until a solution is found the snap needs to be installed with the `--devmode` flag to work properly. So, for the _beta_ release:
+
+    sudo snap install oudedetai --devmode --beta
+
+  Similarly, updates can only be done manually, by this command:
+
+    sudo snap refresh oudedetai --devmode --beta
+
+  This program is created and maintained by the FaithLife Community and is licensed under the MIT License.
+
+grade: stable
+confinement: strict
+icon: ou_dedetai/img/icon.svg # or post-build: snap/img/icon.svg
+license: MIT
+source-code: https://github.com/FaithLife-Community/OuDedetai
+issues: https://github.com/FaithLife-Community/OuDedetai/issues
+contact:
+  - https://t.me/linux_logos
+  - https://matrix.to/#/#logosbible:matrix.org
+website: https://github.com/FaithLife-Community/OuDedetai/wiki
+
+
+platforms:
+  amd64:
+
+environment:
+  # Define config variables.
+  INSTALLDIR: "$SNAP_USER_COMMON"
+  WINE_EXE: "$SNAP/bin/wine64"
+  WINEBIN_CODE: "Custom"
+  # Define runtime variables.
+  # https://forum.snapcraft.io/t/modulenotfounderror-no-module-named-tkinter/28707/5
+  TCL_LIBRARY: $SNAP/usr/share/tcltk/tcl8.6
+  TK_LIBRARY: $SNAP/usr/share/tcltk/tk8.6
+  TCLLIBPATH: $SNAP/usr/lib/tcltk/$CRAFT_ARCH_TRIPLET_BUILD_FOR/tk8.6
+  PYTHON_SITE_PKGS: $SNAP/lib/python3.12/site-packages
+  PYTHON_APT_PKGS: $SNAP/usr/lib/python3.12
+  PYTHON_LIB_DYNLD: $SNAP/usr/lib/python3.12/lib-dynload
+  PYTHONPATH: $PYTHON_SITE_PKGS:$PYTHON_APT_PKGS:$PYTHON_LIB_DYNLD
+  # https://forum.snapcraft.io/t/libpxbackend-1-0-so-cannot-open-shared-object-file-no-such-file-or-directory/44263/2
+  LD_LIBRARY_PATH: $SNAP/usr/lib:$SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR
+
+# FIXME: Also support logos4 and libronixdls URL Schemes by adding a new .desktop file with MimeType. It may just work from there.
+
+apps:
+  oudedetai:
+    extensions: [gnome]
+    command: bin/oudedetai
+    plugs: &allplugs
+      - audio-playback
+      - home
+      - network
+      - opengl
+      - removable-media
+      - system-observe
+      - system-trace
+
+  logos:
+    extensions: [gnome]
+    command: bin/run.sh Logos
+    plugs: *allplugs
+
+  verbum:
+    extensions: [gnome]
+    command: bin/run.sh Verbum
+    plugs: *allplugs
+
+parts:
+  # wine-apt:  # installs most recent devel version
+  #   plugin: nil
+  #   build-packages: [wget]
+  #   override-stage: |
+  #     dpkg --add-architecture i386
+  #     mkdir -pm755 /etc/apt/keyrings
+  #     wget -qO /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
+  #     wget -qNP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/noble/winehq-noble.sources
+  #     apt-get update
+  #     apt-get -y install --install-recommends winehq-devel
+  #     craftctl default
+
+  wine-custom:
+    # source: https://github.com/sil-car/wine-builds/releases/download/wine_10.0/wine_10.0+24.04.tar.xz
+    source: https://github.com/sil-car/wine-builds/releases/download/wine_10.6/wine_10.6+24.04.tar.xz
+    plugin: dump
+    organize:
+      'wine_*/bin': bin
+      'wine_*/lib': lib
+      'wine_*/share': share
+    stage-packages:
+      - libavcodec60
+      - libavformat60
+      - libavutil58
+      - libusb-1.0-0
+      - libxkbregistry0
+
+  wine-deps:
+    plugin: nil
+    stage-packages:
+      - binutils
+      - winbind
+
+  winetricks-deps:  # winetricks itself is downloaded during Logos install
+    plugin: nil
+    stage-packages:
+      - 7zip
+      - cabextract
+      - wget
+
+  oudedetai:
+    source: https://github.com/FaithLife-Community/OuDedetai.git
+    plugin: python
+    override-pull: |
+      craftctl default
+      craftctl set version=$(git describe --tag)
+    # override-stage: |
+
+    stage-packages:
+      - libncurses6
+      - libncursesw6
+      - python3-tk
+
+  oudedetai-dump:
+    source: https://github.com/FaithLife-Community/OuDedetai.git
+    plugin: dump
+    organize:
+      snap/bin/run.sh: bin/run.sh
+      ou_dedetai/assets: assets/
+      ou_dedetai/img: img/
+    stage:
+      - bin/run.sh
+      - assets/
+      - img
+
+  cleanup:
+    after:
+      - wine-custom
+      - oudedetai
+    plugin: nil
+    override-prime: |
+      # Remove libraries from snapcraft build lint warnings.
+      rm -f lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libicudata.so*
+      rm -f usr/lib/libBLTlite.2.5.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libcjson_utils.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libform.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libformw.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libhwy_contrib.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libhwy_test.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libicui18n.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libicuio.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libicutest.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libicutu.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libmenu.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libmenuw.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libpanel.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libpanelw.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libtheora.so*
+      rm -f usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libzvbi-chains.so*

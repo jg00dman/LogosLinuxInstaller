@@ -3,9 +3,10 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
+from math import ceil
 import os
 import time
-from typing import Optional
+from typing import Callable, Optional
 import requests
 import shutil
 import sys
@@ -13,6 +14,7 @@ from base64 import b64encode
 from pathlib import Path
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
+from datetime import datetime
 
 import requests.structures
 
@@ -74,6 +76,12 @@ class SoftwareReleaseInfo:
     download_url: str
 
 
+@dataclass
+class GithubSoftwareReleasesInfo:
+    latest: Optional[SoftwareReleaseInfo]
+    pre_release: Optional[SoftwareReleaseInfo]
+
+
 class UrlProps(Props):
     def __init__(self, url: str):
         super(UrlProps, self).__init__()
@@ -93,7 +101,7 @@ class UrlProps(Props):
             r = requests.head(self.path, allow_redirects=True, headers=h)
         except requests.exceptions.ConnectionError:
             logging.critical("Failed to connect to the server.")
-            raise
+            return requests.structures.CaseInsensitiveDict()
         except Exception as e:
             logging.error(e)
             raise
@@ -103,7 +111,7 @@ class UrlProps(Props):
         content_length = self.headers.get('Content-Length')
         content_encoding = self.headers.get('Content-Encoding')
         if content_encoding is not None:
-            logging.critical(f"The server requires receiving the file compressed as '{content_encoding}'.")  # noqa: E501
+            logging.critical(f"The server requires receiving the file compressed as '{content_encoding}'.")
         logging.debug(f"{content_length=}")
         if content_length is not None:
             self._size = int(content_length)
@@ -115,7 +123,7 @@ class UrlProps(Props):
             if content_md5 is not None:
                 # Convert from hex to base64
                 content_md5_hex = content_md5.strip('"').strip("'")
-                content_md5 = b64encode(bytes.fromhex(content_md5_hex)).decode()  # noqa: E501
+                content_md5 = b64encode(bytes.fromhex(content_md5_hex)).decode()
         else:
             content_md5 = self.headers.get('Content-MD5')
         if content_md5 is not None:
@@ -131,7 +139,7 @@ class CachedRequests:
     """This struct all network requests and saves to a cache"""
     # Some of these values are cached to avoid github api rate-limits
 
-    faithlife_product_releases: dict[str, dict[str, dict[str, list[str]]]] = field(default_factory=dict) # noqa: E501
+    faithlife_product_releases: dict[str, dict[str, dict[str, list[str]]]] = field(default_factory=dict)
     """Cache of faithlife releases.
     
     Since this depends on the user's selection we need to scope the cache based on that
@@ -147,11 +155,24 @@ class CachedRequests:
     
     Keyed by repository slug Owner/Repo
     """
+    repository_latest_pre_release_version: dict[str, str] = field(default_factory=dict)
+    """Cache of the latest version (that may be a pre release) keyed by repository slug
+    
+    Keyed by repository slug Owner/Repo
+    """
+    repository_latest_pre_release_url: dict[str, str] = field(default_factory=dict)
+    """Cache of the latest download url (that may be a pre release) keyed by repository slug
+    
+    Keyed by repository slug Owner/Repo
+    """
 
 
-    url_size_and_hash: dict[str, tuple[Optional[int], Optional[str]]] = field(default_factory=dict) # noqa: E501
+    url_size_and_hash: dict[str, tuple[Optional[int], Optional[str]]] = field(default_factory=dict)
 
     last_updated: Optional[float] = None
+
+    _update_hook: Optional[Callable[[], None]] = None
+
 
     @classmethod
     def load(cls) -> "CachedRequests":
@@ -173,14 +194,23 @@ class CachedRequests:
         return CachedRequests(
             last_updated=time.time()
         )
+    
+    def _as_dict(self) -> dict[str, str]:
+        output = self.__dict__.copy()
+        for output_key in self.__dict__.keys():
+            if output_key.startswith("_"):
+                del output[output_key]
+        return output
 
     def _write(self) -> None:
         """Writes the cache to disk. Done internally when there are changes"""
         path = Path(constants.NETWORK_CACHE_PATH)
-        path.parent.mkdir(exist_ok=True)
+        path.parent.mkdir(exist_ok=True, parents=True)
         with open(path, "w") as f:
-            json.dump(self.__dict__, f, indent=4, sort_keys=True, default=vars)
+            json.dump(self._as_dict(), f, indent=4, sort_keys=True, default=vars)
             f.write("\n")
+        if self._update_hook:
+            self._update_hook()
 
 
     def _is_fresh(self) -> bool:
@@ -192,13 +222,19 @@ class CachedRequests:
             return False
         return True
 
-    def clean_if_stale(self, force: bool = False):
+    def ensure_fresh(self, force: bool = False) -> "CachedRequests":
+        """Returns a CachedRequests that is fresh 
+        
+        - Either an empty new one
+        - Or the existing one
+        """
         if force or not self._is_fresh():
             logging.debug("Cleaning out cache…")
             self = CachedRequests(last_updated=time.time())
             self._write()
         else:
             logging.debug("Cache is valid")
+        return self
 
 
 class NetworkRequests:
@@ -206,9 +242,13 @@ class NetworkRequests:
 
     # This struct uses functions to call due to some of the values requiring parameters
 
-    def __init__(self, force_clean: Optional[bool] = None) -> None:
-        self._cache = CachedRequests.load()
-        self._cache.clean_if_stale(force=force_clean or False)
+    def __init__(
+        self,
+        force_clean: Optional[bool] = None,
+        hook: Callable[[], None] | None = None
+    ) -> None:
+        self._cache = CachedRequests.load().ensure_fresh(force=force_clean or False)
+        self._cache._update_hook = hook
 
     def _faithlife_product_releases(
         self,
@@ -248,9 +288,9 @@ class NetworkRequests:
         self._cache._write()
         return output
     
-    def wine_appimage_recommended_url(self) -> str:
+    def wine_appimage_versions(self) -> GithubSoftwareReleasesInfo:
         repo = "FaithLife-Community/wine-appimages"
-        return self._repo_latest_version(repo).download_url
+        return self._repo_version(repo)
 
     def _url_size_and_hash(self, url: str) -> tuple[Optional[int], Optional[str]]:
         """Attempts to get the size and hash from a URL.
@@ -272,14 +312,50 @@ class NetworkRequests:
     def url_md5(self, url: str) -> Optional[str]:
         return self._url_size_and_hash(url)[1]
 
+    def _repo_version(self, repository: str) -> GithubSoftwareReleasesInfo:
+        output = GithubSoftwareReleasesInfo(latest=None, pre_release=None)
+        if (
+            repository in self._cache.repository_latest_version
+            and repository  in self._cache.repository_latest_url
+        ):
+            output.latest = SoftwareReleaseInfo(
+                version=self._cache.repository_latest_version[repository],
+                download_url=self._cache.repository_latest_url[repository]
+            )
+        if (
+            repository in self._cache.repository_latest_pre_release_version
+            and repository  in self._cache.repository_latest_pre_release_url
+        ):
+            output.pre_release = SoftwareReleaseInfo(
+                version=self._cache.repository_latest_pre_release_version[repository],
+                download_url=self._cache.repository_latest_pre_release_url[repository]
+            )
+        if (
+            output.pre_release is None and output.latest is None
+        ):
+            output = _get_release_data(repository)
+            if output.latest:
+                self._cache.repository_latest_version[repository] = output.latest.version
+                self._cache.repository_latest_url[repository] = output.latest.download_url
+            if output.pre_release:
+                self._cache.repository_latest_pre_release_version[repository] = output.pre_release.version
+                self._cache.repository_latest_pre_release_url[repository] = output.pre_release.download_url
+            self._cache._write()
+        return output
+            
+
     def _repo_latest_version(self, repository: str) -> SoftwareReleaseInfo:
         if (
             repository not in self._cache.repository_latest_version
             or repository not in self._cache.repository_latest_url
         ):
-            result = _get_latest_release_data(repository)
-            self._cache.repository_latest_version[repository] = result.version
-            self._cache.repository_latest_url[repository] = result.download_url
+            result = _get_release_data(repository)
+            if result.latest:
+                self._cache.repository_latest_version[repository] = result.latest.version
+                self._cache.repository_latest_url[repository] = result.latest.download_url
+            if result.pre_release:
+                self._cache.repository_latest_pre_release_version[repository] = result.pre_release.version
+                self._cache.repository_latest_pre_release_url[repository] = result.pre_release.download_url
             self._cache._write()
         return SoftwareReleaseInfo(
             version=self._cache.repository_latest_version[repository],
@@ -288,7 +364,7 @@ class NetworkRequests:
 
     def app_latest_version(self, channel: str) -> SoftwareReleaseInfo:
         if channel == "stable":
-            repo = "FaithLife-Community/LogosLinuxInstaller"
+            repo = "FaithLife-Community/OuDedetai"
         else:
             repo = "FaithLife-Community/test-builds"
         return self._repo_latest_version(repo)
@@ -305,8 +381,7 @@ def logos_reuse_download(
     status_messages: bool = True
 ):
     dirs = [
-        app.conf.install_dir,
-        os.getcwd(),
+        app.conf.user_download_dir,
         app.conf.download_dir,
     ]
     found = 1
@@ -352,6 +427,8 @@ def logos_reuse_download(
             except shutil.SameFileError:
                 pass
         else:
+            # In case we ever get here, give us an opportunity to recover by trying the download again from the start
+            os.remove(file_path)
             app.exit(f"Bad file size or checksum: {file_path}")
 
 
@@ -363,7 +440,7 @@ def _net_get(url: str, target: Optional[Path]=None, app: Optional[App] = None):
     logging.debug(f"Download destination: {target}")
     target_props = FileProps(target)  # sets path and size attribs
     if app and target_props.path:
-        app.status(f"Downloading {target_props.path.name}…")
+        app.status(f"Downloading {target_props.path.name}…", 0)
     parsed_url = urlparse(url)
     domain = parsed_url.netloc  # Gets the requested domain
     url_props = UrlProps(url)  # uses requests to set headers, size, md5 attribs
@@ -377,83 +454,121 @@ def _net_get(url: str, target: Optional[Path]=None, app: Optional[App] = None):
     if type(total_size) is int:
         # Use smaller of 2% of filesize or 2 MB for chunk_size.
         chunk_size = min([int(total_size / 50), 2 * 1024 * 1024])
-    # Force non-compressed file transfer for accurate progress tracking.
-    headers = {'Accept-Encoding': 'identity'}
-    file_mode = 'wb'
 
-    # If file exists and URL is resumable, set download Range.
     if target_props.size:
         logging.debug(f"File exists: {str(target_props.path)}")
-        local_size = target_props.size
-        logging.info(f"Current downloaded size in bytes: {local_size}")
-        if url_props.headers.get('Accept-Ranges') == 'bytes':
-            logging.debug("Server accepts byte range; attempting to resume download.")  # noqa: E501
-            file_mode = 'ab'
-            if type(url_props.size) is int:
-                headers['Range'] = f'bytes={local_size}-{total_size}'
-            else:
-                headers['Range'] = f'bytes={local_size}-'
 
-    logging.debug(f"{chunk_size=}; {file_mode=}; {headers=}")
+    try_again = True
+    last_size = None
 
-    # Log download type.
-    if 'Range' in headers.keys():
-        message = f"Continuing download for {url_props.path}."
-    else:
-        message = f"Starting new download for {url_props.path}."
-    logging.info(message)
+    while try_again:
+        try_again = False
+        # Force non-compressed file transfer for accurate progress tracking.
+        headers = {'Accept-Encoding': 'identity'}
+        file_mode = 'wb'
 
-    # Initiate download request.
-    try:
-        # FIXME: consider splitting this into two functions with a common base.
-        # One that writes into a file, and one that returns a str, 
-        # that share most of the internal logic
-        if target_props.path is None:  # return url content as text
-            with requests.get(url_props.path, headers=headers) as r:
-                if callable(r):
-                    logging.error("Failed to retrieve data from the URL.")
-                    return None
+        target_props = FileProps(target)  # sets path and size attribs
+        # If file exists and URL is resumable, set download Range.
+        if target_props.size:
+            local_size = target_props.size
+            logging.info(f"Current downloaded size in bytes: {local_size}")
+            if url_props.headers.get('Accept-Ranges') == 'bytes':
+                file_mode = 'ab'
+                if type(url_props.size) is int:
+                    headers['Range'] = f'bytes={local_size}-{total_size}'
+                else:
+                    headers['Range'] = f'bytes={local_size}-'
 
-                try:
-                    r.raise_for_status()
-                except requests.exceptions.HTTPError as e:
-                    if domain == "github.com":
-                        if (
-                            e.response.status_code == 403
-                            or e.response.status_code == 429
-                        ):
-                            logging.error("GitHub API rate limit exceeded. Please wait before trying again.")  # noqa: E501
-                    else:
-                        logging.error(f"HTTP error occurred: {e.response.status_code}")  # noqa: E501
-                    return None
+        logging.debug(f"{chunk_size=}; {file_mode=}; {headers=}")
 
-                return r._content  # raw bytes
-        else:  # download url to target.path
-            with requests.get(url_props.path, stream=True, headers=headers) as r:
-                with target_props.path.open(mode=file_mode) as f:
-                    if file_mode == 'wb':
-                        mode_text = 'Writing'
-                    else:
-                        mode_text = 'Appending'
-                    logging.debug(f"{mode_text} data to file {target_props.path}.")
-                    for chunk in r.iter_content(chunk_size=chunk_size):
-                        f.write(chunk)
-                        local_size = os.fstat(f.fileno()).st_size
-                        if type(total_size) is int:
-                            percent = round(local_size / total_size * 10)
-                            # if None not in [app, evt]:
-                            if app:
-                                # Show dots corresponding to show download progress
-                                # While we could use percent, it's likely to interfere
-                                # With whatever install step we are on
-                                message = "Downloading" + "." * percent + "\r"
-                                app.status(message)
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error occurred during HTTP request: {e}")
-        return None  # Return None values to indicate an error condition
+        # Log download type.
+        if 'Range' in headers.keys():
+            message = f"Continuing download for {url_props.path}."
+        else:
+            message = f"Starting new download for {url_props.path}."
+        logging.info(message)
+
+        # Initiate download request.
+        try:
+            # FIXME: consider splitting this into two functions with a common base.
+            # One that writes into a file, and one that returns a str, 
+            # that share most of the internal logic
+            if target_props.path is None:  # return url content as text
+                with requests.get(url_props.path, headers=headers) as r:
+                    if callable(r):
+                        logging.error("Failed to retrieve data from the URL.")
+                        return None
+
+                    try:
+                        r.raise_for_status()
+                    except requests.exceptions.HTTPError as e:
+                        if domain in ["github.com", "api.github.com"]:
+                            if (
+                                e.response.status_code == 403
+                                or e.response.status_code == 429
+                            ):
+                                message = "GitHub API rate limit exceeded. Please wait "
+                                if "x-ratelimit-reset" in r.headers:
+                                    epoch_to_reset: str = r.headers["x-ratelimit-reset"]
+                                    seconds_until_reset = ceil(int(epoch_to_reset) - time.time()) 
+                                    if seconds_until_reset < 120:
+                                        message += f"{seconds_until_reset} seconds "
+                                    else:
+                                        # More human readable to display in minutes
+                                        message += f"{ceil(seconds_until_reset / 60)} minutes " 
+                                message += "before trying again."
+                                logging.error(message)
+                        else:
+                            logging.error(f"HTTP error occurred: {e.response.status_code}")
+                        return None
+
+                    return r._content  # raw bytes
+            else:  # download url to target.path
+                with requests.get(url_props.path, stream=True, headers=headers) as r:
+                    with target_props.path.open(mode=file_mode) as f:
+                        if file_mode == 'wb':
+                            mode_text = 'Writing'
+                        else:
+                            mode_text = 'Appending'
+                        logging.debug(f"{mode_text} data to file {target_props.path}.")
+                        for chunk in r.iter_content(chunk_size=chunk_size):
+                            f.write(chunk)
+                            local_size = os.fstat(f.fileno()).st_size
+                            if type(total_size) is int:
+                                percent = local_size / total_size
+                                # if None not in [app, evt]:
+                                if app:
+                                    # This assumes that there is a 1:1 relationship between
+                                    # steps and download jobs, which is presently true
+                                    # If at some point in the future it is no longer true
+                                    # the worst that'll happen is the progress bar will
+                                    # appear to go backwards.
+                                    app.status(
+                                        f"Downloading {target_props.path.name}…",
+                                        percent
+                                    )
+        except requests.exceptions.RequestException as e:
+            # If this was an incomplete read try again
+            new_size = FileProps(target).size
+            if (
+                total_size is not None
+                and new_size is not None
+                and new_size < total_size 
+                and (
+                    last_size is None 
+                    or new_size > last_size
+                )
+            ):
+                logging.warning(f"Only downloaded a portion of the file on this attempt, retrying: {e}")
+                try_again = True
+                last_size = new_size
+                continue
+
+            logging.error(f"Error occurred during HTTP request: {e}")
+            return None  # Return None values to indicate an error condition
 
 
-def _verify_downloaded_file(url: str, file_path: Path | str, app: App, status_messages: bool = True): #noqa: E501
+def _verify_downloaded_file(url: str, file_path: Path | str, app: App, status_messages: bool = True): 
     if status_messages:
         app.status(f"Verifying {file_path}…", 0)
     file_props = FileProps(file_path)
@@ -495,34 +610,49 @@ def _get_version_name(json_data: dict) -> str:
     return tag_name
 
 
-def _get_latest_release_data(repository) -> SoftwareReleaseInfo:
+def _get_release_data(repository) -> GithubSoftwareReleasesInfo:
     """Gets latest release information
     
     Raises:
         Exception - on failure to make network operation or parse github API
         
     Returns:
-        SoftwareReleaseInfo
+        GithubSoftwareReleasesInfo
     """
-    release_url = f"https://api.github.com/repos/{repository}/releases/latest"
-    data = _net_get(release_url)
+    releases_url = f"https://api.github.com/repos/{repository}/releases"
+    data = _net_get(releases_url)
     if data is None:
-        raise Exception("Could not get latest release URL.")
+        logging.warning("Could not get releases from github.")
+        return GithubSoftwareReleasesInfo(latest=None, pre_release=None)
     try:
-        json_data: dict = json.loads(data.decode())
+        json_data: list[dict] = json.loads(data.decode())
     except json.JSONDecodeError as e:
         logging.error(f"Error decoding Github's JSON response: {e}")
         raise
 
-    download_url = _get_first_asset_url(json_data)
-    version = _get_version_name(json_data)
-    return SoftwareReleaseInfo(
-        version=version,
-        download_url=download_url
-    )
+    json_data = sorted(json_data, key=lambda release: datetime.fromisoformat(release["updated_at"]), reverse=True)
 
-def dwonload_recommended_appimage(app: App):
-    wine64_appimage_full_filename = Path(app.conf.wine_appimage_recommended_file_name)  # noqa: E501
+    pre_release: Optional[SoftwareReleaseInfo] = None
+    latest_release: Optional[SoftwareReleaseInfo] = None
+
+    if json_data and json_data[0]["prerelease"]:
+        pre_release = SoftwareReleaseInfo(
+            version=_get_version_name(json_data[0]),
+            download_url=_get_first_asset_url(json_data[0])
+        )
+
+    json_data = list(filter(lambda release: release["prerelease"] is False, json_data))
+
+    if json_data:
+        latest_release = SoftwareReleaseInfo(
+            version=_get_version_name(json_data[0]),
+            download_url=_get_first_asset_url(json_data[0])
+        )
+
+    return GithubSoftwareReleasesInfo(latest=latest_release, pre_release=pre_release)
+
+def download_recommended_appimage(app: App):
+    wine64_appimage_full_filename = Path(app.conf.wine_appimage_recommended_file_name)
     dest_path = Path(app.conf.installer_binary_dir) / wine64_appimage_full_filename
     if dest_path.is_file():
         return
@@ -539,16 +669,17 @@ def _get_faithlife_product_releases(
     faithlife_product_version: str,
     faithlife_product_release_channel: str
 ) -> list[str]:
-    logging.debug(f"Downloading release list for {faithlife_product} {faithlife_product_version}…")  # noqa: E501
+    logging.debug(f"Downloading release list for {faithlife_product} {faithlife_product_version}…")
     # NOTE: This assumes that Verbum release numbers continue to mirror Logos.
     if faithlife_product_release_channel == "beta":
-        url = "https://clientservices.logos.com/update/v1/feed/logos10/beta.xml"  # noqa: E501
+        url = "https://clientservices.logos.com/update/v1/feed/logos10/beta.xml"
     else:
-        url = f"https://clientservices.logos.com/update/v1/feed/logos{faithlife_product_version}/stable.xml"  # noqa: E501
+        url = f"https://clientservices.logos.com/update/v1/feed/logos{faithlife_product_version}/stable.xml"
     
     response_xml_bytes = _net_get(url)
     if response_xml_bytes is None:
-        raise Exception("Failed to get logos releases")
+        logging.warning("Failed to get logos releases")
+        return []
 
     # Parse XML
     root = ET.fromstring(response_xml_bytes.decode('utf-8-sig'))
@@ -568,12 +699,14 @@ def _get_faithlife_product_releases(
         # if len(releases) == 5:
         #    break
 
-    # Logos 39+ doesn't install
-    filtered_releases = utils.filter_versions(releases, 39, 1)
-    logging.debug(f"Available releases: {', '.join(releases)}")
-    logging.debug(f"Filtered releases: {', '.join(filtered_releases)}")
+    #Filtering not needed at the moment but left here in case we want it later.
+    #Double check this works before releasing.
+    #from packaging.versions import Version
+    #filtered_releases = [version for version in releases if Version("40.0.0.0") > Version(version)]
+    #logging.debug(f"Available releases: {', '.join(releases)}")
+    #logging.debug(f"Filtered releases: {', '.join(filtered_releases)}")
 
-    return filtered_releases
+    return releases
 
 
 def update_lli_binary(app: App):
@@ -581,14 +714,14 @@ def update_lli_binary(app: App):
     lli_download_path = Path(app.conf.download_dir) / constants.BINARY_NAME
     temp_path = Path(app.conf.download_dir) / f"{constants.BINARY_NAME}.tmp"
     logging.debug(
-        f"Updating {constants.APP_NAME} to latest version by overwriting: {lli_file_path}")  # noqa: E501
+        f"Updating {constants.APP_NAME} to latest version by overwriting: {lli_file_path}")
 
     # Remove existing downloaded file if different version.
     if lli_download_path.is_file():
         logging.info("Checking if existing LLI binary is latest version.")
         lli_download_ver = utils.get_lli_release_version(lli_download_path)
-        if not lli_download_ver or lli_download_ver != app.conf.app_latest_version:  # noqa: E501
-            logging.info(f"Removing \"{lli_download_path}\", version: {lli_download_ver}")  # noqa: E501
+        if not lli_download_ver or lli_download_ver != app.conf.app_latest_version:
+            logging.info(f"Removing \"{lli_download_path}\", version: {lli_download_ver}")
             # Remove incompatible file.
             lli_download_path.unlink()
 

@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import signal
 import subprocess
 import time
@@ -7,7 +8,9 @@ import logging
 import psutil
 import threading
 
+from ou_dedetai import constants, database
 from ou_dedetai.app import App
+from ou_dedetai.config import get_logos_user_id
 
 from . import system
 from . import utils
@@ -32,9 +35,9 @@ class LogosManager:
         """These are processes we discovered already running"""
 
     def monitor_indexing(self):
-        if self.app.conf.logos_indexer_exe in self.existing_processes:
-            indexer = self.existing_processes.get(self.app.conf.logos_indexer_exe)
-            if indexer and isinstance(indexer[0], psutil.Process) and indexer[0].is_running():  # noqa: E501
+        if self.app.conf.logos_indexer_exe_windows_path in self.existing_processes:
+            indexer = self.existing_processes.get(self.app.conf.logos_indexer_exe_windows_path)
+            if indexer and isinstance(indexer[0], psutil.Process) and indexer[0].is_running():
                 self.indexing_state = State.RUNNING
             else:
                 self.indexing_state = State.STOPPED
@@ -45,10 +48,10 @@ class LogosManager:
         cef = []
         if self.app.conf.logos_exe:
             splash = self.existing_processes.get(self.app.conf.logos_exe, [])
-        if self.app.conf.logos_login_exe:
-            login = self.existing_processes.get(self.app.conf.logos_login_exe, [])
-        if self.app.conf.logos_cef_exe:
-            cef = self.existing_processes.get(self.app.conf.logos_cef_exe, [])
+        if self.app.conf.logos_system_exe_windows_path:
+            login = self.existing_processes.get(self.app.conf.logos_system_exe_windows_path, [])
+        if self.app.conf.logos_cef_exe_windows_path:
+            cef = self.existing_processes.get(self.app.conf.logos_cef_exe_windows_path, [])
 
         splash_running = splash[0].is_running() if splash else False
         login_running = login[0].is_running() if login else False
@@ -76,16 +79,14 @@ class LogosManager:
         app = self.app
         # FIXME: consider refactoring to make one call to get a system pids
         # Currently this gets all system pids 4 times
-        if app.conf.logos_exe:
-            self.existing_processes[app.conf.logos_exe] = system.get_pids(app.conf.logos_exe) # noqa: E501
-        if app.conf.wine_user:
-            # Also look for the system's Logos.exe (this may be the login window)
-            logos_system_exe = f"C:\\users\\{app.conf.wine_user}\\AppData\\Local\\Logos\\System\\Logos.exe" #noqa: E501
-            self.existing_processes[logos_system_exe] = system.get_pids(logos_system_exe) # noqa: E501
-        if app.conf.logos_indexer_exe:
-            self.existing_processes[app.conf.logos_indexer_exe] = system.get_pids(app.conf.logos_indexer_exe)  # noqa: E501
-        if app.conf.logos_cef_exe:
-            self.existing_processes[app.conf.logos_cef_exe] = system.get_pids(app.conf.logos_cef_exe) # noqa: E501
+        for exe_path in [
+            app.conf.logos_exe,
+            app.conf.logos_system_exe_windows_path,
+            app.conf.logos_indexer_exe_windows_path,
+            app.conf.logos_cef_exe_windows_path
+        ]:
+            if exe_path:
+                self.existing_processes[exe_path] = system.get_pids(exe_path)
 
     def monitor(self):
         if self.app.is_installed():
@@ -96,21 +97,78 @@ class LogosManager:
             except Exception as e:
                 # pass
                 logging.error(e)
+        else:
+            # Useful if the install directory got deleted while executing
+            self.logos_state = State.STOPPED
+
+    def monitor_for_potential_issues(self):
+        """A function to be run in parallel with running Logos to detect common issues and suggest workarounds"""
+        # Make sure we have a logos appdata, without it we can't reliably do any checks
+        logos_appdata_dir = self.app.conf._logos_appdata_dir
+        if logos_appdata_dir is None:
+            logging.warning("The user should have installed the Logos application by now and have this populated."
+                            " Waiting until that is resolved…")
+            while logos_appdata_dir is None:
+                time.sleep(1)
+                logos_appdata_dir = self.app.conf._logos_appdata_dir
+        
+        # See if the user is logged in, this may change which things we look for
+        is_user_logged_in: bool = False
+        if get_logos_user_id(logos_appdata_dir) is not None:
+            is_user_logged_in = True
+
+        sent_trouble_signing_in_message: bool = False
+
+        time_logos_started = time.time()
+
+        while True:
+            # Now we wait...
+            time.sleep(10)
+
+            if not is_user_logged_in:
+                if get_logos_user_id(logos_appdata_dir) is not None:
+                    # User's now logged in - no fuss.
+                    is_user_logged_in = True
+                else:
+                    # Took me about ~1.5 minutes to sign on while simulating a little dilly-dallying and a couple
+                    # incorrect password attempts. Should still be longer than most people take to sign on, but not SO
+                    # long that people close OD in frustration to try again - fine line of balance.
+                    if not sent_trouble_signing_in_message and time.time() - time_logos_started > 60 * 1.75:
+                        # It's been five minutes since the user launched Logos and yet they haven't logged in yet.
+                        # Are they having trouble?
+                        self.app.pop_up(
+                            "Trouble Signing In?",
+                            "If you're having trouble signing in, try these workarounds:\n\n" \
+                            "If the browser isn't launching after you hit \"Sign In\" in the Logos application "
+                            "consider installing firefox from your system's package manager and temporarily setting "
+                            "that as your default browser.\n\n"
+                            "If the browser opens and entering your credentials is successful but nothing happens: "
+                            "on the Logos browser page try hitting the button for not being redirected automatically "
+                            "then click on the link that shows up that suggests to click it if you're still having "
+                            "trouble. That should cause you to sign in on the Logos application.\n\n"
+                            f"If you still need help use \"Get Support\" on the main page of {constants.APP_NAME}"
+                        )
+                        # We only want to send this message once
+                        sent_trouble_signing_in_message = True
+
 
     def start(self):
         self.logos_state = State.STARTING
         wine_release, _ = wine.get_wine_release(self.app.conf.wine_binary)
 
         def run_logos():
+            self.prevent_logos_updates()
+            self.set_auto_updates(False)
             if not self.app.conf.logos_exe:
                 raise ValueError("Could not find installed Logos EXE to run")
-            process = wine.run_wine_proc(
-                self.app.conf.wine_binary,
+            process = wine.run_wine_application(
                 self.app,
+                self.app.conf.wine_binary,
                 exe=self.app.conf.logos_exe
             )
             if process is not None:
                 self.processes[self.app.conf.logos_exe] = process
+            self.logos_state = State.RUNNING
 
         # Ensure wine version is compatible with Logos release version.
         good_wine, reason = wine.check_wine_rules(
@@ -124,11 +182,9 @@ class LogosManager:
             if reason is not None:
                 logging.debug(f"Warning: Wine Check: {reason}")
             wine.wineserver_kill(self.app)
-            app = self.app
-            from ou_dedetai.gui_app import GuiApp
-            if not isinstance(self.app, GuiApp):
-                # Don't send "Running" message to GUI b/c it never clears.
-                app.status(f"Running {self.app.conf.faithlife_product}…")
+            # Don't send "Running" message to GUI b/c it never clears.
+            logging.info(f"Running {self.app.conf.faithlife_product}…")
+            self.app.start_thread(self.monitor_for_potential_issues, daemon_bool=False)
             self.app.start_thread(run_logos, daemon_bool=False)
             # NOTE: The following code would keep the CLI open while running
             # Logos, but since wine logging is sent directly to wine.log,
@@ -143,6 +199,70 @@ class LogosManager:
             #     while self.logos_state != State.STOPPED:
             #         time.sleep(0.1)
             #         self.monitor()
+
+    # For now enforce this all the time, ideally we wouldn't override the user's choice
+    # But risks as they are, setting it to false is safer for now.
+    # Feel free to revisit when there is less chances of it breaking an install
+    def set_auto_updates(self, val: bool):
+        """Edits Logos' internal db entry corresponding to the option in:
+        Program Settings -> Internet -> Automatically Download New Resources
+        """
+        if self.app.conf._logos_appdata_dir is None:
+            return
+        logos_appdata_dir = Path(self.app.conf._logos_appdata_dir)
+        logos_user_id = self.app.conf._logos_user_id
+        if not logos_user_id:
+            return None
+        db_path = logos_appdata_dir / "Documents" / logos_user_id / "LocalUserPreferences" / "PreferencesManager.db" 
+        sql = (
+            """UPDATE Preferences SET Data='<data """ +
+            ('OptIn="true"' if val else 'OptIn="false"') +
+            """ StartDownloadHour="0" StopDownloadHour="0" MarkNewResourcesAsCloud="true" />' """
+            """ WHERE Type='UpdateManagerPreferences'""" 
+        )
+        self.app.start_thread(database.watch_db, str(db_path), [sql])
+
+    def prevent_logos_updates(self):
+        """Edits Logos' internal database to remove pending installers
+        before it has a chance to apply them
+        """
+        if self.app.conf._logos_appdata_dir is None:
+            return
+        logos_appdata_dir = Path(self.app.conf._logos_appdata_dir)
+        logos_user_id = self.app.conf._logos_user_id
+        if logos_user_id is None:
+            return None
+        db_path = logos_appdata_dir / "Data" / logos_user_id / "UpdateManager" / "Updates.db"
+        # FIXME: I wonder if we can use the result of these deletion using RETURNING
+        # Then we could notify the user that there are updates.
+        # If we do that we'd have to consider if their other resources are up to date
+        # AND if their library is index and their library is prepared.
+        # Logos probably should be off for this
+        sql = [
+            # "DELETE FROM Installers WHERE 1",
+            # Cleanup the Update Ids that are associated with an application update
+            "DELETE FROM UpdateUrls WHERE UpdateId IN " +
+                "(SELECT UpdateId FROM Updates WHERE Source='Application Update')",
+            # Cleanup database relations and removes Application Updates
+            # Fixes corrupt DBs caused by an earlier
+            # version of the software #275
+            # If we don't do this, the application will crash when it tries to update.
+            "DELETE FROM Updates WHERE UpdateId NOT IN "+
+                "(SELECT UpdateId FROM UpdateUrls) OR "+
+                "Source='Application Update'",
+            # Also remove any UpdateId references that don't exist
+            "UPDATE Resources SET Status=1, UpdateId=NULL WHERE UpdateId IS NOT NULL "+
+                "AND UpdateId NOT IN (SELECT UpdateId FROM Updates)"
+        ]
+        self.app.start_thread(database.watch_db, str(db_path), sql)
+
+    # Also noticed if the database Data/*/CloudResourceManager/CloudResources.db 
+    # table TransitionStates has a ResourceId that isn't registered in UpdateManager,
+    # logos will crash on startup. It can be recovered by removing those TransitionState
+    # entries.
+    # Perhaps we should attempt to recover in this state.
+    # Since there are no known user interaction steps to get into this state, leaving it
+    # alone for now. Only found it when manually modifying the database.
 
     def stop(self):
         logging.debug("Stopping LogosManager.")
@@ -160,19 +280,19 @@ class LogosManager:
         if pids:
             try:
                 system.run_command(['kill', '-9'] + pids)
-                self.logos_state = State.STOPPED
-                logging.debug(f"Stopped Logos processes at PIDs {', '.join(pids)}.")  # noqa: E501
+                logging.debug(f"Stopped Logos processes at PIDs {', '.join(pids)}.")
             except Exception as e:
-                logging.debug(f"Error while stopping Logos processes: {e}.")  # noqa: E501
+                logging.debug(f"Error while stopping Logos processes: {e}.")
         else:
             logging.debug("No Logos processes to stop.")
-            self.logos_state = State.STOPPED
-        wine.wineserver_wait(self.app)
+        self.logos_state = State.STOPPED
+        # The Logos process has exited, if we wait here it hangs
+        # wine.wineserver_wait(self.app)
 
     def end_processes(self):
         for process_name, process in self.processes.items():
             if isinstance(process, subprocess.Popen):
-                logging.debug(f"Found {process_name} in Processes. Attempting to close {process}.")  # noqa: E501
+                logging.debug(f"Found {process_name} in Processes. Attempting to close {process}.")
                 try:
                     process.terminate()
                     process.wait(timeout=10)
@@ -185,15 +305,15 @@ class LogosManager:
         index_finished = threading.Event()
 
         def run_indexing():
-            if not self.app.conf.logos_indexer_exe:
+            if not self.app.conf.logos_indexer_exe_windows_path:
                 raise ValueError("Cannot find installed indexer")
-            process = wine.run_wine_proc(
-                self.app.conf.wine_binary,
+            process = wine.run_wine_application(
                 app=self.app,
-                exe=self.app.conf.logos_indexer_exe
+                wine_binary=self.app.conf.wine_binary,
+                exe=self.app.conf.logos_indexer_exe_windows_path
             )
             if process is not None:
-                self.processes[self.app.conf.logos_indexer_exe] = process
+                self.processes[self.app.conf.logos_indexer_exe_windows_path] = process
 
         def check_if_indexing(process: threading.Thread):
             start_time = time.time()
@@ -208,7 +328,7 @@ class LogosManager:
                     elapsed_min = int(total_elapsed_time // 60)
                     elapsed_sec = int(total_elapsed_time % 60)
                     formatted_time = f"{elapsed_min}m {elapsed_sec}s"
-                    self.app.status(f"Indexing is running… (Elapsed Time: {formatted_time})")  # noqa: E501
+                    self.app.status(f"Indexing is running… (Elapsed Time: {formatted_time})")
                     update_send = 0
             index_finished.set()
 
@@ -233,22 +353,22 @@ class LogosManager:
         self.indexing_state = State.STOPPING
         if self.app:
             pids = []
-            for process_name in [self.app.conf.logos_indexer_exe]:
+            for process_name in [self.app.conf.logos_indexer_exe_windows_path]:
                 if process_name is None:
                     continue
                 process = self.processes.get(process_name)
                 if process:
                     pids.append(str(process.pid))
                 else:
-                    logging.debug(f"No LogosIndexer processes found for {process_name}.")  # noqa: E501
+                    logging.debug(f"No LogosIndexer processes found for {process_name}.")
 
             if pids:
                 try:
                     system.run_command(['kill', '-9'] + pids)
                     self.indexing_state = State.STOPPED
-                    self.app.status(f"Stopped LogosIndexer processes at PIDs {', '.join(pids)}.")  # noqa: E501
+                    self.app.status(f"Stopped LogosIndexer processes at PIDs {', '.join(pids)}.")
                 except Exception as e:
-                    logging.debug(f"Error while stopping LogosIndexer processes: {e}.")  # noqa: E501
+                    logging.debug(f"Error while stopping LogosIndexer processes: {e}.")
             else:
                 logging.debug("No LogosIndexer processes to stop.")
                 self.indexing_state = State.STOPPED
@@ -263,7 +383,7 @@ class LogosManager:
                 self.app
             )
         except Exception as e:
-            logging.warning(f"Failed to determine if logging was enabled, assuming no: {e}") #noqa: E501
+            logging.warning(f"Failed to determine if logging was enabled, assuming no: {e}") 
             current_value = None
         if current_value == '0x1':
             state = 'ENABLED'
@@ -295,9 +415,9 @@ class LogosManager:
             'add', 'HKCU\\Software\\Logos4\\Logging', '/v', 'Enabled',
             '/t', 'REG_DWORD', '/d', value, '/f'
         ]
-        process = wine.run_wine_proc(
-            self.app.conf.wine_binary,
+        process = wine.run_wine_during_install(
             app=self.app,
+            wine_binary=self.app.conf.wine_binary,
             exe='reg',
             exe_args=exe_args
         )

@@ -4,6 +4,7 @@ import curses
 import logging.handlers
 from typing import Callable, Tuple
 
+from ou_dedetai.app import UserExitedFromAsk
 from ou_dedetai.config import (
     EphemeralConfiguration, PersistentConfiguration, get_wine_prefix_path
 )
@@ -11,6 +12,8 @@ from ou_dedetai.config import (
 import logging
 import os
 import sys
+
+from .repair import detect_and_recover
 
 from . import cli
 from . import constants
@@ -43,14 +46,6 @@ def get_parser():
         help='skip dependencies check and installation',
     )
     cfg.add_argument(
-        '-F', '--skip-fonts', action='store_true',
-        help='skip font installations',
-    )
-    cfg.add_argument(
-        '-W', '--skip-winetricks', action='store_true',
-        help='skip winetricks installations. For development purposes only!!!',
-    )
-    cfg.add_argument(
         '-V', '--verbose', action='store_true',
         help='enable verbose mode',
     )
@@ -68,7 +63,7 @@ def get_parser():
     cfg.add_argument(
         '-f', '--force-root', action='store_true',
         help=(
-            "Running Wine/winetricks as root is highly discouraged. "
+            "Running Wine as root is highly discouraged. "
             "Set this to do allow it anyways"
         ),
     )
@@ -80,14 +75,23 @@ def get_parser():
         '-L', '--delete-log', action='store_true',
         help='delete the log file',
     )
+    # FIXME: remove this deprecated option.
+    # If we remove this today, scripts using -P will fail, as now it's an "unknown option"
     cfg.add_argument(
         '-P', '--passive', action='store_true',
-        help='run product installer non-interactively',
+        help='Legacy argument that used to specify to run the product installer non-interactively. '
+        'Now this is the default. '
+        'Consider agreeing to the terms as well --i-agree-to-faithlife-terms',
     )
     cfg.add_argument(
         '-y', '--assume-yes', action='store_true',
         help='Assumes yes (or default) to all prompts. '
-        'Useful for entirely non-interactive installs',
+        'Useful for entirely non-interactive installs. '
+        'Consider agreeing to the terms as well --i-agree-to-faithlife-terms',
+    )
+    cfg.add_argument(
+        '--i-agree-to-faithlife-terms', action='store_true',
+        help='By passing this flag you agree to https://faithlife.com/terms',
     )
     cfg.add_argument(
         '-q', '--quiet', action='store_true',
@@ -106,6 +110,10 @@ def get_parser():
     cmd.add_argument(
         '--install-app', action='store_true',
         help='install FaithLife app',
+    )
+    cmd.add_argument(
+        '--update-installed-app', action='store_true',
+        help='update the installed FaithLife app to the latest release',
     )
     cmd.add_argument(
         '--run-installed-app', '-C', action='store_true',
@@ -138,13 +146,11 @@ def get_parser():
     )
     cmd.add_argument(
         '--backup', action='store_true',
-        # help='perform backup',
-        help=argparse.SUPPRESS,
+        help='backup current data',
     )
     cmd.add_argument(
         '--restore', action='store_true',
-        # help='perform restore',
-        help=argparse.SUPPRESS,
+        help='restore data from backup',
     )
     cmd.add_argument(
         '--update-self', '-u', action='store_true',
@@ -159,22 +165,6 @@ def get_parser():
         help='Update the AppImage symlink. Requires a path.',
     )
     cmd.add_argument(
-        '--get-winetricks', action='store_true',
-        help='download or update Winetricks',
-    )
-    cmd.add_argument(
-        '--run-winetricks', action='store_true',
-        help='start Winetricks window',
-    )
-    cmd.add_argument(
-        '--install-d3d-compiler', action='store_true',
-        help='Install d3dcompiler through Winetricks',
-    )
-    cmd.add_argument(
-        '--install-fonts', action='store_true',
-        help='Install fonts through Winetricks',
-    )
-    cmd.add_argument(
         '--install-icu', action='store_true',
         help='Install ICU data files for Logos 30+',
     )
@@ -187,8 +177,8 @@ def get_parser():
         help='[re-]create app shortcuts',
     )
     cmd.add_argument(
-        '--remove-install-dir', action='store_true',
-        help='delete the current installation folder',
+        '--uninstall', action='store_true',
+        help='Completely delete the faithlife software from your system',
     )
     cmd.add_argument(
         '--dirlink', action='store_true',
@@ -201,13 +191,24 @@ def get_parser():
         help=argparse.SUPPRESS,
     )
     cmd.add_argument(
-        '--winetricks', nargs='+',
+        '--get-support', action='store_true',
+        help='Generates a support bundle and prints out where to go for support',
+    )
+    cmd.add_argument(
+        '--wine', nargs="+",
+        help=(
+            'run wine command'
+            '; WARNING: wine will not accept user input!'
+        ),
+    )
+    cmd.add_argument(
+        '--winetricks', nargs='*',
         help="run winetricks command",
     )
     return parser
 
 
-def parse_args(args, parser) -> Tuple[EphemeralConfiguration, Callable[[EphemeralConfiguration], None]]: #noqa: E501
+def parse_args(args, parser) -> Tuple[EphemeralConfiguration, Callable[[EphemeralConfiguration], None]]: 
     if args.config:
         ephemeral_config = EphemeralConfiguration.load_from_path(args.config)
     else:
@@ -222,6 +223,10 @@ def parse_args(args, parser) -> Tuple[EphemeralConfiguration, Callable[[Ephemera
 
     if args.debug:
         msg.update_log_level(logging.DEBUG)
+        if not ephemeral_config.wine_debug:
+            ephemeral_config.wine_debug = constants.DEFAULT_WINEDEBUG
+        # Developers may want to consider adding +relay for excessive debug output
+        ephemeral_config.wine_debug+=',+loaddll,+pid,+threadname'
 
     if args.delete_log:
         ephemeral_config.delete_log = True
@@ -229,18 +234,12 @@ def parse_args(args, parser) -> Tuple[EphemeralConfiguration, Callable[[Ephemera
     if args.set_appimage:
         ephemeral_config.wine_appimage_path = args.set_appimage[0]
 
-    if args.skip_fonts:
-        ephemeral_config.install_fonts_skip = True
-
-    if args.skip_winetricks:
-        ephemeral_config.winetricks_skip = True
-
     # FIXME: Should this have been args.check_for_updates?
     # Should this even be an option?
     # if network.check_for_updates:
     #     ephemeral_config.check_updates_now = True
 
-    if args.skip_dependencies:
+    if args.skip_dependencies or constants.RUNMODE == 'snap':
         ephemeral_config.install_dependencies_skip = True
 
     if args.force_root:
@@ -251,20 +250,25 @@ def parse_args(args, parser) -> Tuple[EphemeralConfiguration, Callable[[Ephemera
             # Set legacy environment variable for config to pick up
             os.environ["CUSTOMBINPATH"] = args.custom_binary_path
         else:
-            message = f"Custom binary path does not exist: \"{args.custom_binary_path}\"\n"  # noqa: E501
+            message = f"Custom binary path does not exist: \"{args.custom_binary_path}\"\n"
             parser.exit(status=1, message=message)
+
+    if args.assume_yes and not args.i_agree_to_faithlife_terms:
+        message = ("Non-interactive installations MUST also agree to the EULA https://faithlife.com/terms "
+                   "via the flag --i-agree-to-faithlife-terms\n")
+        parser.exit(status=1, message=message)
 
     if args.assume_yes:
         ephemeral_config.assume_yes = True
 
-    if args.passive or args.assume_yes:
-        ephemeral_config.faithlife_install_passive = True
+    if args.i_agree_to_faithlife_terms:
+        ephemeral_config.agreed_to_faithlife_terms = True
 
 
     def cli_operation(action: str) -> Callable[[EphemeralConfiguration], None]:
         """Wrapper for a function pointer to a given function under CLI
         
-        Lazilay instantiates CLI at call-time"""
+        Lazily instantiates CLI at call-time"""
         def _run(config: EphemeralConfiguration):
             getattr(cli.CLI(config), action)()
         output = _run
@@ -276,42 +280,43 @@ def parse_args(args, parser) -> Tuple[EphemeralConfiguration, Callable[[Ephemera
         'backup',
         'create_shortcuts',
         'edit_config',
-        'get_winetricks',
-        'install_app',
-        'install_d3d_compiler',
         'install_dependencies',
-        'install_fonts',
         'install_icu',
         'remove_index_files',
-        'remove_install_dir',
+        'uninstall',
         'remove_library_catalog',
         'restore',
         'run_indexing',
         'run_installed_app',
+        'update_installed_app',
         'stop_installed_app',
-        'run_winetricks',
         'set_appimage',
         'toggle_app_logging',
         'update_self',
         'update_latest_appimage',
+        'wine',
         'winetricks',
+        "get_support"
     ]
 
     run_action = None
     for arg in actions:
-        if getattr(args, arg):
+        if getattr(args, arg) or getattr(args, arg) == []:
             if arg == "set_appimage":
                 ephemeral_config.wine_appimage_path = getattr(args, arg)[0]
                 if not utils.file_exists(ephemeral_config.wine_appimage_path):
-                    e = f"Invalid file path: '{ephemeral_config.wine_appimage_path}'. File does not exist."  # noqa: E501
+                    e = f"Invalid file path: '{ephemeral_config.wine_appimage_path}'. File does not exist."
                     raise argparse.ArgumentTypeError(e)
                 if not utils.check_appimage(ephemeral_config.wine_appimage_path):
                     e = f"{ephemeral_config.wine_appimage_path} is not an AppImage."
                     raise argparse.ArgumentTypeError(e)
-            if arg == 'winetricks':
-                ephemeral_config.winetricks_args = getattr(args, 'winetricks')
+            # Re-use this variable for either wine or winetricks execution
+            elif arg == 'wine' or arg == 'winetricks':
+                ephemeral_config.wine_args = getattr(args, arg)
             run_action = cli_operation(arg)
             break
+    if getattr(args, "install_app"):
+        run_action = install_app
     if run_action is None:
         run_action = run_control_panel
     logging.debug(f"{run_action=}")
@@ -322,10 +327,10 @@ def run_control_panel(ephemeral_config: EphemeralConfiguration):
     dialog = ephemeral_config.dialog or system.get_dialog()
     logging.info(f"Using DIALOG: {dialog}")
     if dialog == 'tk':
-        gui_app.control_panel_app(ephemeral_config)
+        gui_app.start_gui_app(ephemeral_config)
     else:
         try:
-            curses.wrapper(tui_app.control_panel_app, ephemeral_config)
+            tui_app.control_panel_app(ephemeral_config)
         except KeyboardInterrupt:
             raise
         except SystemExit:
@@ -338,8 +343,16 @@ def run_control_panel(ephemeral_config: EphemeralConfiguration):
             logging.error(f"An error occurred in run_control_panel(): {e}")
             raise e
 
+def install_app(ephemeral_config: EphemeralConfiguration):
+    dialog = ephemeral_config.dialog or system.get_dialog()
+    logging.info(f"Using DIALOG: {dialog}")
+    if dialog == 'tk':
+        gui_app.start_gui_app(ephemeral_config, install_only=True)
+    else:
+        cli.CLI(ephemeral_config).install_app()
 
-def setup_config() -> Tuple[EphemeralConfiguration, Callable[[EphemeralConfiguration], None]]: #noqa: E501
+
+def setup_config() -> Tuple[EphemeralConfiguration, Callable[[EphemeralConfiguration], None]]: 
     parser = get_parser()
     cli_args = parser.parse_args()  # parsing early lets 'help' run immediately
 
@@ -361,15 +374,19 @@ def setup_config() -> Tuple[EphemeralConfiguration, Callable[[EphemeralConfigura
 
 
 def is_app_installed(ephemeral_config: EphemeralConfiguration):
-    persistent_config = PersistentConfiguration.load_from_path(ephemeral_config.config_path) #noqa: E501
-    if persistent_config.faithlife_product is None or persistent_config.install_dir is None: #noqa: E501
+    persistent_config = PersistentConfiguration.load_from_path(ephemeral_config.config_path) 
+    if persistent_config.faithlife_product is None or persistent_config.install_dir is None: 
         # Not enough information stored to find the product
         return False
-    wine_prefix = ephemeral_config.wine_prefix or get_wine_prefix_path(str(persistent_config.install_dir)) #noqa: E501
-    return utils.find_installed_product(persistent_config.faithlife_product, wine_prefix) #noqa: E501
+    wine_prefix = ephemeral_config.wine_prefix or get_wine_prefix_path(str(persistent_config.install_dir)) 
+    return utils.find_installed_product(persistent_config.faithlife_product, wine_prefix) 
 
 
-def run(ephemeral_config: EphemeralConfiguration, action: Callable[[EphemeralConfiguration], None]): #noqa: E501
+def run(ephemeral_config: EphemeralConfiguration, action: Callable[[EphemeralConfiguration], None]): 
+    # Attempt to repair installation if it is broken.
+    # Must be done before calling the action to avoid errosly thinking the app isn't
+    # installed when it's broken
+    detect_and_recover(ephemeral_config)
     # Run desired action (requested function, defaults to control_panel)
     if action == "disabled":
         print("That option is disabled.", file=sys.stderr)
@@ -385,19 +402,16 @@ def run(ephemeral_config: EphemeralConfiguration, action: Callable[[EphemeralCon
     install_required = [
         'backup',
         'create_shortcuts',
-        'install_d3d_compiler',
-        'install_fonts',
         'install_icu',
         'remove_index_files',
         'remove_library_catalog',
         'restore',
         'run_indexing',
         'run_installed_app',
+        'update_installed_app',
         'stop_installed_app',
-        'run_winetricks',
         'set_appimage',
         'toggle_app_logging',
-        'winetricks',
     ]
     if action.__name__ not in install_required:
         logging.info(f"Running function: {action.__name__}")
@@ -405,10 +419,10 @@ def run(ephemeral_config: EphemeralConfiguration, action: Callable[[EphemeralCon
     elif is_app_installed(ephemeral_config):  # install_required; checking for app
         # wine.set_logos_paths()
         # Run the desired Logos action.
-        logging.info(f"Running function: {action.__name__}")  # noqa: E501
+        logging.info(f"Running function: {action.__name__}")
         action(ephemeral_config)
     else:  # install_required, but app not installed
-        print("App is not installed, but required for this operation. Consider installing first.", file=sys.stderr) #noqa: E501
+        print("App is not installed, but required for this operation. Consider installing first.", file=sys.stderr) 
         sys.exit(1)
 
 
@@ -433,13 +447,19 @@ def main():
     # program.
     # utils.die_if_running()
     if os.getuid() == 0 and not ephemeral_config.app_run_as_root_permitted:
-        print("Running Wine/winetricks as root is highly discouraged. Use -f|--force-root if you must run as root. See https://wiki.winehq.org/FAQ#Should_I_run_Wine_as_root.3F", file=sys.stderr)  # noqa: E501
+        print("Running Wine/winetricks as root is highly discouraged. Use -f|--force-root if you must run as root. "
+              "See https://wiki.winehq.org/FAQ#Should_I_run_Wine_as_root.3F", file=sys.stderr)
         sys.exit(1)
 
     # Print terminal banner
-    logging.info(f"{constants.APP_NAME}, {constants.LLI_CURRENT_VERSION} by {constants.LLI_AUTHOR}.")  # noqa: E501
+    logging.info(f"{constants.APP_NAME}, {constants.LLI_CURRENT_VERSION} by {constants.LLI_AUTHOR}.")
 
-    run(ephemeral_config, action)
+    try:
+        run(ephemeral_config, action)
+    except UserExitedFromAsk:
+        # This isn't a critical failure, the user doesn't need a traceback,
+        # they are the ones who told us to exit.
+        pass
 
 
 if __name__ == '__main__':

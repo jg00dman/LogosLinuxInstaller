@@ -1,12 +1,19 @@
+import math
+import os
 import queue
 import shutil
+import sys
 import threading
+import time
 from typing import Optional, Tuple
 
+from ou_dedetai import constants
 from ou_dedetai.app import App
 from ou_dedetai.config import EphemeralConfiguration
 from ou_dedetai.system import SuperuserCommandNotFound
+from ou_dedetai.logos import State as LogosRunningState
 
+from . import backup
 from . import control
 from . import installer
 from . import wine
@@ -24,7 +31,7 @@ class CLI(App):
         self.start_thread(self.user_input_processor)
 
     def backup(self):
-        control.backup(app=self)
+        backup.backup(app=self)
 
     def create_shortcuts(self):
         installer.create_launcher_shortcuts(self)
@@ -32,21 +39,16 @@ class CLI(App):
     def edit_config(self):
         control.edit_file(self.conf.config_file_path)
 
-    def get_winetricks(self):
-        control.set_winetricks(self)
-
     def install_app(self):
         installer.install(self)
         self.exit("Install has finished", intended=True)
 
-    def install_d3d_compiler(self):
-        wine.install_d3d_compiler(self)
+    def update_installed_app(self):
+        utils.update_faithlife_product(self)
+        self.exit("Update has finished", intended=True)
 
     def install_dependencies(self):
         utils.install_dependencies(app=self)
-
-    def install_fonts(self):
-        wine.install_fonts(self)
 
     def install_icu(self):
         wine.enforce_icu_data_files(self)
@@ -54,26 +56,57 @@ class CLI(App):
     def remove_index_files(self):
         control.remove_all_index_files(self)
 
-    def remove_install_dir(self):
-        control.remove_install_dir(self)
+    def uninstall(self):
+        control.uninstall(self)
 
     def remove_library_catalog(self):
         control.remove_library_catalog(self)
 
     def restore(self):
-        control.restore(app=self)
+        backup.restore(app=self)
 
     def run_indexing(self):
         self.logos.index()
 
     def run_installed_app(self):
         self.logos.start()
+        # Keep the process running so that our background threads can keep running
+        while self.logos.logos_state != LogosRunningState.STOPPED:
+            # A worker thread (e.g. the memory watchdog) may have asked us to
+            # exit; run it here on the main thread so the process truly stops.
+            if self._pending_exit is not None:
+                self.exit(*self._pending_exit)
+            time.sleep(3)
+            self.logos.monitor()
 
     def stop_installed_app(self):
         self.logos.stop()
 
-    def run_winetricks(self):
-        wine.run_winetricks(self)
+    def winetricks(self):
+        process = wine.run_wine_process(
+            self,
+            self.conf.winetricks_binary,
+            sys.stdout,
+            sys.stderr,
+            sys.stdin,
+            exe_args=(self.conf._overrides.wine_args or [])
+        )
+        if process:
+            process.wait()
+            sys.exit(process.returncode)
+
+    def wine(self):
+        process = wine.run_wine_process(
+            self,
+            self.conf.wine64_binary,
+            sys.stdout,
+            sys.stderr,
+            sys.stdin,
+            exe_args=(self.conf._overrides.wine_args or [])
+        )
+        if process:
+            process.wait()
+            sys.exit(process.returncode)
 
     def set_appimage(self):
         utils.set_appimage_symlink(app=self)
@@ -87,10 +120,10 @@ class CLI(App):
     def update_self(self):
         utils.update_to_latest_lli_release(self)
 
-    def winetricks(self):
-        wine.run_winetricks(self, *(self.conf._overrides.winetricks_args or []))
+    def get_support(self):
+        control.get_support(self)
 
-    _exit_option: str = "Exit"
+    _exit_option: str | None = "Exit"
 
     def _ask(self, question: str, options: list[str] | str) -> str:
         """Passes the user input to the user_input_processor thread
@@ -109,33 +142,76 @@ class CLI(App):
         # NOTE: this response is validated in App's .ask
         return output
 
+    def _info(self, message: str) -> None:
+        """Display information to the user"""
+        self.input_q.put((message, ['Continue?']))
+        self.input_event.set()
+        self.choice_event.wait()
+        self.choice_event.clear()
+
+    @classmethod
+    def print(_cls, message: str):
+        """Prints a message to the console.
+        
+        Use this instead of python's print.
+
+        Handles implementation detail of drawing nicely
+        even if there was progress bar displayed
+        """
+        print(
+            (
+                # "\033[2K" is the ANSI code for clearing the current line
+                b"\033[2K\r"
+                + message.encode("utf-8")
+                + b"\n\r"
+            ).decode(),
+            end=""
+        )
+
+    def _schedule_exit_on_main_thread(self, reason: str, intended: bool) -> None:
+        # Same handling - exit happens to be thread safe today.
+        self._exit(reason=reason, intended=intended)
+
     def exit(self, reason: str, intended: bool = False):
         # Signal CLI.user_input_processor to stop.
         self.input_q.put(None)
         self.input_event.set()
         # Signal CLI itself to stop.
         self.running = False
+        # We always want this to return regardless of level
+        self.print(f"Closing {constants.APP_NAME} due to: {reason}")
         return super().exit(reason, intended)
     
     def _status(self, message: str, percent: Optional[int] = None):
-        """Implementation for updating status pre-front end"""
-        prefix = ""
-        end = "\n"
-        # Signifies we want to overwrite the last line
-        if message.endswith("\r"):
-            end = "\r"
-        if message == self._last_status:
-            # Go back to the beginning of the line to re-write the current line
-            # Rather than sending a new one. This allows the current line to update
-            prefix += "\r"
-            end = "\r"
+        """Implementation for updating status pre-front end
+        
+        This implementation adds a progres bar.
+        
+        It should be noted this progress bar won't display nicely if
+        other sources call to python's print. Use Cli.print() instead.
+        """
+        # Enforce percent is not over 100
+        if percent is not None and percent > 100:
+            percent = 100
+        progress_str = ""
+        # We don't want to display 100% as it doesn't print nicely.
         if percent is not None:
-            percent_per_char = 5
-            chars_of_progress = round(percent / percent_per_char)
-            chars_remaining = round((100 - percent) / percent_per_char)
-            progress_str = "[" + "-" * chars_of_progress + " " * chars_remaining + "] "
-            prefix += progress_str
-        print(f"{prefix}{message}", end=end)
+            # -2 is for the brackets, -1 is for the >
+            progress_bar_length = os.get_terminal_size().columns - 2 -1
+            # Subtract one for the >
+            chars_of_progress = math.floor(float(progress_bar_length) * percent / 100) #noqa: E501
+            chars_remaining = progress_bar_length - chars_of_progress
+            progress_str = "[" + "-" * chars_of_progress + ">" + " " * chars_remaining + "]" #noqa: E501
+
+        if message != self._last_status:
+            self.print(message)
+        # Write my progress then carriage return
+        # (so we're back at the beginning for the next log line)
+        if progress_str:
+            print(progress_str, end="\r")
+
+    def _pop_up(self, title, message):
+        self._status(message=message)
 
     @property
     def superuser_command(self) -> str:
